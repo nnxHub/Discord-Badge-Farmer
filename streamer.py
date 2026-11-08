@@ -154,147 +154,13 @@ class Console:
     def banner(self) -> None:
         self.clear()
         print()
-        print(f"  {self.CYAN}██████╗ ██╗    ██╗██████╗ ██╗     ██╗   ██╗ ██████╗ ██╗███╗   ██╗███████╗{self.RESET}")
-        print(f"  {self.CYAN}██╔══██╗██║    ██║██╔══██╗██║     ██║   ██║██╔════╝ ██║████╗  ██║██╔════╝{self.RESET}")
-        print(f"  {self.CYAN}██████╔╝██║ █╗ ██║██████╔╝██║     ██║   ██║██║  ███╗██║██╔██╗ ██║███████╗{self.RESET}")
-        print(f"  {self.CYAN}██╔══██╗██║███╗██║██╔═══╝ ██║     ██║   ██║██║   ██║██║██║╚██╗██║╚════██║{self.RESET}")
-        print(f"  {self.CYAN}██║  ██║╚███╔███╔╝██║     ███████╗╚██████╔╝╚██████╔╝██║██║ ╚████║███████║{self.RESET}")
-        print(f"  {self.CYAN}╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝     ╚══════╝ ╚═════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝{self.RESET}")
-        print(f"                 {self.WHITE}Разработано студией RWPlugins{self.RESET}")
-        print(f"                  {self.CYAN}https://t.me/RWplugins{self.RESET}")
-        print(f"  {self.GREY}{'─' * 72}{self.RESET}")
-        print(f"  {self.MAGENTA}Discord Badge Maximizer{self.RESET} {self.GREY}·{self.RESET} {self.WHITE}Фарм значка «Стриминг» (0% CPU / 0% GPU){self.RESET}")
+        print(f"  {self.CYAN}stream maximizer{self.RESET} {self.GREY}·{self.RESET} {self.WHITE}discord stream time badge{self.RESET}")
+        print(f"    {self.GREY}gateway + voice + go live streaming engine{self.RESET}")
         print()
 
 
 
 CONFIG_FILE = ROOT / "config.json"
-
-class AutoViewer:
-    """Headless alt-account watcher that sits in the voice channel and watches the stream (Op 20)."""
-    def __init__(self, token: str, guild_id: str, channel_id: str, console: "Console"):
-        self.token = token.strip()
-        self.guild_id = str(guild_id)
-        self.channel_id = str(channel_id)
-        self.console = console
-        self.running = False
-        self.ws: MiniWebSocket | None = None
-        self.thread: threading.Thread | None = None
-        self.heartbeat_interval = 41.25
-        self.sequence = None
-        self.stream_key = ""
-        self.is_watching = False
-
-    def start(self, stream_key: str) -> None:
-        if not self.token or self.running:
-            return
-        self.stream_key = stream_key
-        self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-
-    def _run(self) -> None:
-        C = self.console
-        C.info(f"{C.CYAN}alt-viewer{C.RESET} · connecting alt account to voice channel...")
-        try:
-            self.ws = MiniWebSocket(GATEWAY_URL, path="/?v=9&encoding=json")
-            self.ws.connect()
-        except Exception as exc:
-            C.err("alt-viewer", f"connect failed: {exc}")
-            self.running = False
-            return
-
-        last_hb = time.time()
-        identified = False
-
-        while self.running:
-            try:
-                now = time.time()
-                if identified and (now - last_hb > self.heartbeat_interval):
-                    if self.ws and not self.ws.closed:
-                        try:
-                            self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
-                            last_hb = now
-                        except Exception:
-                            pass
-
-                msg = self.ws.recv(timeout=1.0)
-                if not msg:
-                    continue
-
-                if isinstance(msg, dict) and msg.get("op") == "close":
-                    break
-
-                op = msg.get("op")
-                seq = msg.get("s")
-                t = msg.get("t")
-                d = msg.get("d") or {}
-
-                if seq is not None:
-                    self.sequence = seq
-
-                if op == 10:
-                    self.heartbeat_interval = d.get("heartbeat_interval", 41250) / 1000.0
-                    last_hb = time.time()
-                    self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
-                    self.ws.send(json.dumps({
-                        "op": 2,
-                        "d": {
-                            "token": self.token,
-                            "capabilities": 16381,
-                            "properties": _local_props(),
-                            "presence": {
-                                "status": "online",
-                                "since": 0,
-                                "activities": [],
-                                "afk": False,
-                            },
-                        }
-                    }))
-                    identified = True
-
-                elif op == 0 and t == "READY":
-                    C.ok("alt-viewer", "alt account authorized!")
-                    self.ws.send(json.dumps({
-                        "op": 4,
-                        "d": {
-                            "guild_id": self.guild_id,
-                            "channel_id": self.channel_id,
-                            "self_mute": True,
-                            "self_deaf": True,
-                        }
-                    }))
-                    time.sleep(1.0)
-                    if self.stream_key:
-                        self.ws.send(json.dumps({
-                            "op": 20,
-                            "d": {
-                                "stream_key": self.stream_key
-                            }
-                        }))
-                        self.is_watching = True
-                        C.ok("alt-viewer", f"alt account is now WATCHING the stream!")
-
-            except Exception:
-                time.sleep(2.0)
-
-    def stop(self) -> None:
-        self.running = False
-        self.is_watching = False
-        if self.ws and not self.ws.closed:
-            try:
-                self.ws.send(json.dumps({
-                    "op": 4,
-                    "d": {
-                        "guild_id": self.guild_id,
-                        "channel_id": None,
-                        "self_mute": True,
-                        "self_deaf": True,
-                    }
-                }))
-                self.ws.close()
-            except Exception:
-                pass
 
 
 
@@ -310,6 +176,7 @@ class State:
     last_guild_id: str = ""
     last_channel_id: str = ""
     viewer_token: str = ""
+    auto_start: bool = False
 
     @classmethod
     def load(cls) -> "State":
@@ -335,6 +202,8 @@ class State:
                     inst.last_channel_id = str(cfg["channel_id"]).strip()
                 if cfg.get("viewer_token"):
                     inst.viewer_token = cfg["viewer_token"].strip()
+                if "auto_start" in cfg:
+                    inst.auto_start = bool(cfg["auto_start"])
             except Exception:
                 pass
         return inst
@@ -899,6 +768,283 @@ class VoiceConnection:
             self.ws.close()
 
 
+class AutoViewer:
+    def __init__(self, token: str, guild_id: str, channel_id: str, console: Console, target_user_id: str = ""):
+        self.token = token.strip()
+        self.guild_id = str(guild_id)
+        self.channel_id = str(channel_id)
+        self.console = console
+        self.target_user_id = str(target_user_id).strip()
+        self.user_id = _user_id_from_token(self.token)
+        self.running = False
+        self.ws: MiniWebSocket | None = None
+        self.voice_conn: VoiceConnection | None = None
+        self.thread: threading.Thread | None = None
+        self.heartbeat_interval = 41.25
+        self.sequence = None
+        self.session_id = ""
+        self.voice_session_id = ""
+        self.voice_token = ""
+        self.voice_endpoint = ""
+        self.voice_connected = False
+        self.stream_key = f"guild:{self.guild_id}:{self.channel_id}:{self.target_user_id}" if self.target_user_id else ""
+        self.is_watching = False
+        self.watch_start_time = 0.0
+        self.username = ""
+
+    def start(self, stream_key: str = "") -> None:
+        if not self.token or self.running:
+            return
+        if stream_key:
+            self.stream_key = stream_key
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _send_voice_state_join(self) -> None:
+        if self.ws and not self.ws.closed:
+            try:
+                self.ws.send(json.dumps({
+                    "op": 4,
+                    "d": {
+                        "guild_id": self.guild_id,
+                        "channel_id": self.channel_id,
+                        "self_mute": True,
+                        "self_deaf": True,
+                    }
+                }))
+            except Exception:
+                pass
+
+    def _send_watch_stream(self) -> None:
+        if not self.stream_key or not self.ws or self.ws.closed:
+            return
+        try:
+            self.ws.send(json.dumps({
+                "op": 20,
+                "d": {
+                    "stream_key": self.stream_key
+                }
+            }))
+            self.is_watching = True
+            self.watch_start_time = time.time()
+            self.console.live("alt-viewer", f"твинк смотрит трансляцию ({self.stream_key})")
+        except Exception:
+            pass
+
+    def _connect_voice_server(self, endpoint: str, token: str) -> None:
+        C = self.console
+        if self.voice_conn:
+            try:
+                self.voice_conn.close()
+            except Exception:
+                pass
+            self.voice_conn = None
+            self.voice_connected = False
+
+        self.voice_token = token
+        self.voice_endpoint = endpoint
+        session_id = self.voice_session_id or self.session_id
+
+        self.voice_conn = VoiceConnection(
+            endpoint=endpoint,
+            server_id=self.guild_id,
+            user_id=self.user_id,
+            session_id=session_id,
+            token=token,
+            console=C,
+            label="alt-voice",
+            is_stream=False,
+        )
+
+        C.info(f"{C.CYAN}alt-voice{C.RESET} · подключение к голосовому серверу...")
+        if self.voice_conn.connect():
+            self.voice_conn.start_heartbeat()
+            self.voice_conn.send_speaking(False)
+            self.voice_conn.start_silence_pump()
+            self.voice_connected = True
+            C.ok("alt-voice", f"твинк закреплён в голосовом канале (ssrc={self.voice_conn.ssrc})")
+            if self.stream_key:
+                time.sleep(0.5)
+                self._send_watch_stream()
+            else:
+                C.ok("alt-viewer", "твинк в голосовом канале, ожидает запуск стрима...")
+        else:
+            C.warn("alt-voice", "не удалось установить связь с голосовым сервером твинка")
+
+    def _run(self) -> None:
+        C = self.console
+        while self.running:
+            try:
+                C.info(f"{C.CYAN}alt-viewer{C.RESET} · подключение твинка к шлюзу Discord...")
+                self.ws = MiniWebSocket(GATEWAY_URL, path="/?v=9&encoding=json")
+                self.ws.connect()
+                last_hb = time.time()
+                identified = False
+
+                while self.running and self.ws and not self.ws.closed:
+                    now = time.time()
+                    if identified and (now - last_hb > self.heartbeat_interval):
+                        try:
+                            self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
+                            last_hb = now
+                        except Exception:
+                            pass
+
+                    msg = self.ws.recv(timeout=1.0)
+                    if not msg:
+                        continue
+
+                    if isinstance(msg, dict) and msg.get("op") == "close":
+                        break
+
+                    op = msg.get("op")
+                    seq = msg.get("s")
+                    t = msg.get("t")
+                    d = msg.get("d") or {}
+
+                    if seq is not None:
+                        self.sequence = seq
+
+                    if op == 10:
+                        self.heartbeat_interval = d.get("heartbeat_interval", 41250) / 1000.0
+                        last_hb = time.time()
+                        self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
+                        self.ws.send(json.dumps({
+                            "op": 2,
+                            "d": {
+                                "token": self.token,
+                                "capabilities": 16381,
+                                "properties": _local_props(),
+                                "presence": {
+                                    "status": "online",
+                                    "since": 0,
+                                    "activities": [],
+                                    "afk": False,
+                                },
+                            }
+                        }))
+                        identified = True
+
+                    elif op == 11:
+                        last_hb = time.time()
+
+                    elif op == 7:
+                        C.warn("alt-viewer", "запрошено переподключение к шлюзу...")
+                        break
+
+                    elif op == 9:
+                        C.warn("alt-viewer", "сессия недействительна, повторный вход...")
+                        time.sleep(1.0)
+                        break
+
+                    elif op == 0:
+                        if t == "READY":
+                            u = d.get("user") or {}
+                            self.username = u.get("username", "alt")
+                            self.user_id = str(u.get("id") or self.user_id)
+                            self.session_id = d.get("session_id", "")
+                            C.ok("alt-viewer", f"твинк авторизован ({self.username})")
+                            self._send_voice_state_join()
+
+                        elif t == "VOICE_STATE_UPDATE":
+                            u_id = str(d.get("user_id", ""))
+                            if u_id == self.user_id:
+                                active_ch = d.get("channel_id")
+                                sess = d.get("session_id", "")
+                                if sess:
+                                    self.voice_session_id = sess
+                                if active_ch is None:
+                                    if self.voice_connected or self.is_watching:
+                                        C.warn("alt-viewer", "твинк был отключен от войса, выполняем перезаход...")
+                                    self.voice_connected = False
+                                    self.is_watching = False
+                                    if self.voice_conn:
+                                        self.voice_conn.close()
+                                        self.voice_conn = None
+                                    if self.running:
+                                        time.sleep(2.0)
+                                        self._send_voice_state_join()
+                            elif d.get("self_stream"):
+                                if not self.target_user_id or u_id == self.target_user_id:
+                                    ch = d.get("channel_id", self.channel_id)
+                                    self.stream_key = f"guild:{self.guild_id}:{ch}:{u_id}"
+                                    if self.voice_connected:
+                                        self._send_watch_stream()
+
+                        elif t == "VOICE_SERVER_UPDATE":
+                            v_guild = str(d.get("guild_id", ""))
+                            if v_guild == str(self.guild_id):
+                                token = d.get("token", "")
+                                endpoint = d.get("endpoint") or ""
+                                if endpoint and token:
+                                    self._connect_voice_server(endpoint, token)
+
+                        elif t == "STREAM_CREATE":
+                            sk = d.get("stream_key", "")
+                            if sk and (not self.target_user_id or self.target_user_id in sk):
+                                self.stream_key = sk
+                                if self.voice_connected:
+                                    self._send_watch_stream()
+
+                        elif t == "STREAM_DELETE":
+                            del_sk = d.get("stream_key", "")
+                            if not self.stream_key or del_sk == self.stream_key:
+                                self.is_watching = False
+                                C.warn("alt-viewer", "стрим остановлен, твинк ждёт перезапуска в канале...")
+
+            except Exception as exc:
+                if self.running:
+                    C.warn("alt-viewer", f"сбой соединения твинка: {exc}, повтор...")
+                    time.sleep(3.0)
+
+            if self.voice_conn:
+                try:
+                    self.voice_conn.close()
+                except Exception:
+                    pass
+                self.voice_conn = None
+            self.voice_connected = False
+            self.is_watching = False
+            if self.ws:
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
+                self.ws = None
+            if self.running:
+                time.sleep(2.0)
+
+    def stop(self) -> None:
+        self.running = False
+        self.is_watching = False
+        self.voice_connected = False
+        if self.voice_conn:
+            try:
+                self.voice_conn.close()
+            except Exception:
+                pass
+            self.voice_conn = None
+        if self.ws and not self.ws.closed:
+            try:
+                self.ws.send(json.dumps({
+                    "op": 4,
+                    "d": {
+                        "guild_id": self.guild_id,
+                        "channel_id": None,
+                        "self_mute": True,
+                        "self_deaf": True,
+                    }
+                }))
+            except Exception:
+                pass
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+
 PERMISSION_ADMINISTRATOR = 1 << 3       # 8
 PERMISSION_STREAM        = 1 << 9       # 512 (Go Live / Video)
 PERMISSION_VIEW_CHANNEL  = 1 << 10      # 1024
@@ -1162,9 +1308,17 @@ class GatewayStreamEngine:
                 status = f"{self.console.CYAN}⏳ starting stream{self.console.RESET}"
             else:
                 status = f"{self.console.YELLOW}⏳ reconnecting{self.console.RESET}"
+            viewer_str = ""
+            if self.auto_viewer:
+                if self.auto_viewer.is_watching:
+                    viewer_str = f" · {self.console.CYAN}твинк смотрит{self.console.WHITE}"
+                elif self.auto_viewer.voice_connected:
+                    viewer_str = f" · {self.console.GREY}твинк в войсе{self.console.WHITE}"
+                else:
+                    viewer_str = f" · {self.console.YELLOW}твинк подключается{self.console.WHITE}"
             self.console.live(
                 "stream",
-                f"{status} · {mins}m ({hours:.2f}h) elapsed"
+                f"{status} · {mins}m ({hours:.2f}h) elapsed{viewer_str}"
             )
 
     def _reconnect(self, guild_id: str, channel_id: str, can_resume: bool = True) -> bool:
@@ -1833,6 +1987,15 @@ class StreamMaximizerApp:
         else:
             C.warn("crypto", "cryptography not installed · pip install cryptography for audio frames")
 
+        if getattr(self.state, "auto_start", False) or "--auto" in sys.argv:
+            if self.state.last_guild_id and self.state.last_channel_id:
+                C.ok("auto", f"auto-start active · streaming to guild {self.state.last_guild_id} channel {self.state.last_channel_id}")
+                engine = GatewayStreamEngine(self.state, self.session, self.console)
+                engine.start_stream(self.state.last_guild_id, self.state.last_channel_id)
+                return
+            else:
+                C.warn("auto", "auto_start requested but guild_id or channel_id missing")
+
         time.sleep(0.5)
         self.menu()
 
@@ -1933,6 +2096,85 @@ class StreamMaximizerApp:
         engine = GatewayStreamEngine(self.state, self.session, self.console)
         engine.start_stream(guild_id, channel_id)
 
+    def run_standalone_alt_viewer(self) -> None:
+        """Run only the alt account as a watcher while user streams from Discord desktop app."""
+        C = self.console
+        C.rule()
+        C.info(f"{C.CYAN}Режим Авто-Зрителя (Твинк-бот){C.RESET}")
+        C.info("Этот режим подключает только ваш твинк в голосовой канал.")
+        C.info("Вы можете сидеть в войсе и стримить сами со своего официального Discord клиента,")
+        C.info("а твинк будет сидеть рядом и смотреть трансляцию 24/7 (часы идут в зачёт).")
+        C.rule()
+        print()
+
+        if not self.state.viewer_token:
+            C.warn("auth", "Токен твинка не найден в конфигурации.")
+            C.info("Вставьте токен вашего второго аккаунта (твинка):")
+            entered = input(f"  {C.GREY}viewer_token:{C.RESET} ").strip()
+            if not entered:
+                C.err("auth", "Токен твинка обязателен для этого режима.")
+                time.sleep(1.5)
+                return
+            self.state.viewer_token = entered
+            self.state.save()
+
+        guild_id = input(f"  {C.GREY}ID сервера [{self.state.last_guild_id}] (Enter чтобы использовать):{C.RESET} ").strip() or self.state.last_guild_id
+        channel_id = input(f"  {C.GREY}ID голосового канала [{self.state.last_channel_id}] (Enter чтобы использовать):{C.RESET} ").strip() or self.state.last_channel_id
+
+        if not guild_id or not channel_id:
+            C.err("input", "ID сервера и канала обязательны.")
+            time.sleep(1.5)
+            return
+
+        self.state.last_guild_id = guild_id
+        self.state.last_channel_id = channel_id
+        self.state.save()
+
+        target_uid = _user_id_from_token(self.state.token)
+        viewer = AutoViewer(self.state.viewer_token, guild_id, channel_id, self.console, target_user_id=target_uid)
+        viewer.start()
+
+        print()
+        C.rule()
+        C.ok("status", "Твинк запущен в фоновом режиме.")
+        C.info("Теперь вы можете запустить стрим в Discord клиенте.")
+        C.info(f"Нажмите {C.ORANGE}[Enter]{C.WHITE} в любой момент, чтобы остановить твинка и выйти в меню.")
+        C.rule()
+
+        start_t = time.time()
+        last_status_t = time.time()
+        try:
+            import msvcrt
+            has_msvcrt = True
+        except Exception:
+            has_msvcrt = False
+
+        try:
+            while viewer.running:
+                if has_msvcrt and msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    if ch in (b'\r', b'\n', b'\x03'):
+                        break
+                time.sleep(0.2)
+                now = time.time()
+                if now - last_status_t >= 30.0:
+                    last_status_t = now
+                    elapsed_m = int((now - start_t) / 60)
+                    if viewer.is_watching:
+                        st = f"{C.GREEN}👁 Смотрит стрим{C.WHITE}"
+                    elif viewer.voice_connected:
+                        st = f"{C.CYAN}🔊 В голосовом канале (ждёт стрим){C.WHITE}"
+                    else:
+                        st = f"{C.YELLOW}⏳ Подключение к войсу...{C.WHITE}"
+                    C.info(f"{C.CYAN}[alt-viewer]{C.RESET} В сети: {elapsed_m} мин. · Статус: {st}")
+        except (KeyboardInterrupt, Exception):
+            pass
+        finally:
+            viewer.stop()
+            print()
+            C.ok("exit", "Твинк успешно отключен от голосового канала.")
+            time.sleep(1)
+
     def menu(self) -> None:
         C = self.console
         while True:
@@ -1940,10 +2182,11 @@ class StreamMaximizerApp:
             C.banner()
             C.info(f"total stream hours: {C.ORANGE}{self.state.total_stream_hours_claimed:,.1f}h{C.WHITE} ({self.state.total_stream_sessions} sessions)")
             C.rule()
-            C.info(f"{C.ORANGE}1{C.RESET} · {C.MAGENTA}Start Live Stream{C.RESET} (Gateway AFK Go Live Broadcast)")
-            C.info(f"{C.ORANGE}2{C.RESET} · Inspect Discord Profile & Badges")
-            C.info(f"{C.ORANGE}3{C.RESET} · Refresh Auth (Token & Cookie)")
-            C.info(f"{C.ORANGE}4{C.RESET} · Exit")
+            C.info(f"{C.ORANGE}1{C.RESET} · {C.MAGENTA}Авто-Стрим + Твинк{C.RESET} (Headless вещание с основы 0% CPU/GPU + авто-зритель)")
+            C.info(f"{C.ORANGE}2{C.RESET} · {C.CYAN}Только Твинк-Зритель{C.RESET} (Вы стримите сами в Discord, твинк смотрит)")
+            C.info(f"{C.ORANGE}3{C.RESET} · Проверить профиль и статистику значков")
+            C.info(f"{C.ORANGE}4{C.RESET} · Обновить токены и настройки авторизации")
+            C.info(f"{C.ORANGE}5{C.RESET} · Выход")
             C.rule()
 
             choice = input(f"  {C.ORANGE}›{C.RESET} ").strip()
@@ -1951,10 +2194,12 @@ class StreamMaximizerApp:
             if choice == "1":
                 self.run_gateway_live_streamer()
             elif choice == "2":
-                inspect_profile(self.state, self.session, self.console)
+                self.run_standalone_alt_viewer()
             elif choice == "3":
+                inspect_profile(self.state, self.session, self.console)
+            elif choice == "4":
                 self._refresh()
-            elif choice in ("4", "exit", "q"):
+            elif choice in ("5", "exit", "q"):
                 break
             else:
                 C.warn("input", "invalid option")
