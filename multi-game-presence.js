@@ -6,20 +6,21 @@
     const MIN_CHANGE_MS = 23 * 60 * 1000;
     const MAX_CHANGE_MS = 38 * 60 * 1000;
     const AUTO_CLAIM = true;
-    const AUTO_CLAIM_COUNT = 125; // Infinity = every win32 game in the CDN list
+    const AUTO_CLAIM_COUNT = 125;
     const AUTO_CLAIM_HOURS = 1.5;
-    const BATCH_GAMES = 5;
-    const BATCH_DELAY_MS = 4000;
+    const BATCH_GAMES = 4;
+    const BATCH_DELAY_MS = 5500;
     const STAGGER_MINUTES = 25;
 
-    const CLIENT_VERSION = "1.0.9253";
-    const CLIENT_BUILD_NUMBER = 594031;
-    const NATIVE_BUILD_NUMBER = 88414;
-    const OS_VERSION = "10.0.26200";
-    const MACHINE_GUID = "b5a79402-959c-4861-a579-2821dfbb3c2b";
-    const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 " +
-        "Electron/42.7.1 Safari/537.36";
+    const CLIENT_VERSION = "1.0.9267";
+    const CLIENT_BUILD_NUMBER = 667580;
+    const NATIVE_BUILD_NUMBER = 97793;
+    const OS_VERSION = "10.0.26100";
+    const USER_AGENT = navigator.userAgent || (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) discord/1.0.9267 Chrome/152.0.7977.169 " +
+        "Electron/44.10.0 Safari/537.36"
+    );
 
     if (window[LOCK]) {
         console.warn("[Multi Game Presence] Already running. To stop: window.__multiGamePresence.stop()");
@@ -188,6 +189,7 @@
         }
 
         async function generateFingerprint(userId) {
+            const machineId = uuid();
             const out = new Uint8Array(146);
             out[0] = 1;
             out[1] = 3;
@@ -196,10 +198,10 @@
             view.setUint32(6, 0, true);
             view.setUint32(10, 1700000000, true);
             view.setUint32(14, 50000000, true);
-            out.set(await sha256("header"), 18);
-            out.set(await sha256(MACHINE_GUID + userId), 50);
-            out.set(await sha256("sections"), 82);
-            out.set(await sha256("cert"), 114);
+            out.set(await sha256("header_" + userId), 18);
+            out.set(await sha256(machineId + userId), 50);
+            out.set(await sha256("sections_" + userId), 82);
+            out.set(await sha256("cert_" + userId), 114);
             const key = await sha256(userId + "https://discord.com/careers");
             for (let i = 1; i < out.length; i++) out[i] ^= key[(i - 1) & 31];
             let binary = "";
@@ -219,8 +221,8 @@
                 system_locale: "en-US",
                 has_client_mods: false,
                 browser_user_agent: USER_AGENT,
-                browser_version: "42.7.1",
-                os_sdk_version: "26200",
+                browser_version: "44.10.0",
+                os_sdk_version: "26100",
                 client_build_number: CLIENT_BUILD_NUMBER,
                 native_build_number: NATIVE_BUILD_NUMBER,
                 client_event_source: null,

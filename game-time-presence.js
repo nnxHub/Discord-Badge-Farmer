@@ -17,9 +17,9 @@
     const CONFIG = Object.freeze({
         totalHours: 6000,
         games: 250,
-        batchSize: 25,
-        delayMs: 450,
-        wobble: false,
+        batchSize: 15,
+        delayMs: 1200,
+        wobble: true,
         dryRun: false
     });
 

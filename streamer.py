@@ -1,25 +1,3 @@
-#!/usr/bin/env python3
-"""
-Discord Stream Time Engine
-
-Headless Gateway + Voice + Go Live streamer that accumulates
-real streaming hours for the Discord Streaming Badge.
-
-Unlike game badges (tracked via client-side /science telemetry),
-the streaming badge requires an ACTIVE gateway voice session with
-a registered Go Live stream. This script:
-
-1. Connects to Discord's main Gateway WebSocket
-2. Joins a voice channel (Opcode 4 Voice State Update)
-3. Completes the Voice WebSocket + UDP handshake
-4. Initiates Go Live (Opcode 18 Stream Create)
-5. Connects to the stream's dedicated Voice WebSocket
-6. Pumps silent Opus audio frames to maintain the session
-7. Manages heartbeats across all 3 WebSocket connections
-
-Requirements: Python 3.10+, no external dependencies.
-Optional: pip install cryptography (for encrypted silent audio frames)
-"""
 from __future__ import annotations
 
 import base64
@@ -48,6 +26,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "session.json"
+LOG_FILE = ROOT / "streamer.log"
 
 ME_URL = "https://discord.com/api/v9/users/@me?with_analytics_token=true"
 USERS_URL = "https://discord.com/api/v9/users"
@@ -55,14 +34,14 @@ SCIENCE_URL = "https://discord.com/api/v9/science"
 PROPERTIES_URL = "https://cordapi.dolfi.es/api/v2/properties/windows"
 GATEWAY_URL = "gateway.discord.gg"
 
-CLIENT_VERSION = "1.0.9253"
-CLIENT_BUILD_NUMBER = 594031
-NATIVE_BUILD_NUMBER = 88414
-OS_VERSION = "10.0.26200"
+CLIENT_VERSION = "1.0.9267"
+CLIENT_BUILD_NUMBER = 667580
+NATIVE_BUILD_NUMBER = 97793
+OS_VERSION = "10.0.26100"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 "
-    "Electron/42.7.1 Safari/537.36"
+    "(KHTML, like Gecko) discord/1.0.9267 Chrome/152.0.7977.169 "
+    "Electron/44.10.0 Safari/537.36"
 )
 
 AUTH_MAX_AGE = 12 * 3600
@@ -92,6 +71,18 @@ def _user_id_from_token(token: str) -> str:
         return ""
 
 
+def _default_client_state() -> dict:
+    return {
+        "guild_versions": {},
+        "highest_last_message_id": "0",
+        "read_state_version": 0,
+        "user_guild_settings_version": -1,
+        "user_settings_version": -1,
+        "private_channels_version": "0",
+        "api_code_version": 0,
+    }
+
+
 class Console:
     RED = "\x1b[91m"
     ORANGE = "\x1b[38;5;208m"
@@ -105,6 +96,7 @@ class Console:
     RULE = "─" * 48
 
     def __init__(self) -> None:
+        self._log_lock = threading.Lock()
         try:
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
@@ -114,18 +106,44 @@ class Console:
 
     @staticmethod
     def _enable_ansi() -> None:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+            in_handle = kernel32.GetStdHandle(-10)
+            in_mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(in_handle, ctypes.byref(in_mode)):
+                kernel32.SetConsoleMode(in_handle, (in_mode.value & ~0x0040) | 0x0080)
+        except Exception:
+            pass
+
+    def _write_log(self, text: str) -> None:
+        try:
+            import re
+            clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with self._log_lock:
+                if LOG_FILE.exists() and LOG_FILE.stat().st_size > 2 * 1024 * 1024:
+                    try:
+                        lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-1000:]
+                        LOG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    except Exception:
+                        pass
+                with open(LOG_FILE, "a", encoding="utf-8") as fp:
+                    fp.write(f"[{stamp}] {clean}\n")
+        except Exception:
+            pass
 
     def _stamp(self) -> str:
         return f"{self.GREY}{time.strftime('%H:%M:%S')}{self.RESET}"
 
     def _line(self, glyph: str, target: str, detail: str, color: str) -> None:
-        print(f"  {self._stamp()} {glyph} {self.WHITE}{target}{self.RESET} {self.GREY}·{self.RESET} {color}{detail}{self.RESET}")
+        msg = f"  {self._stamp()} {glyph} {self.WHITE}{target}{self.RESET} {self.GREY}·{self.RESET} {color}{detail}{self.RESET}"
+        print(msg, flush=True)
+        self._write_log(f"{target} · {detail}")
 
     def ok(self, target: str, detail: str) -> None:
         self._line(f"{self.GREEN}✓{self.RESET}", target, detail, self.GREEN)
@@ -143,20 +161,22 @@ class Console:
         self._line(f"{self.RED}✗{self.RESET}", target, detail, self.RED)
 
     def info(self, detail: str) -> None:
-        print(f"  {self._stamp()} {self.GREY}·{self.RESET} {self.WHITE}{detail}{self.RESET}")
+        msg = f"  {self._stamp()} {self.GREY}·{self.RESET} {self.WHITE}{detail}{self.RESET}"
+        print(msg, flush=True)
+        self._write_log(detail)
 
     def rule(self) -> None:
-        print(f"  {self.GREY}{self.RULE}{self.RESET}")
+        print(f"  {self.GREY}{self.RULE}{self.RESET}", flush=True)
 
     def clear(self) -> None:
-        print("\x1b[2J\x1b[3J\x1b[H", end="")
+        print("\x1b[2J\x1b[3J\x1b[H", end="", flush=True)
 
     def banner(self) -> None:
         self.clear()
         print()
         print(f"  {self.CYAN}stream maximizer{self.RESET} {self.GREY}·{self.RESET} {self.WHITE}discord stream time badge{self.RESET}")
-        print(f"    {self.GREY}gateway + voice + go live streaming engine{self.RESET}")
-        print()
+        print(f"    {self.GREY}gateway + voice + go live streaming engine (anti-ban v2.0){self.RESET}")
+        print(flush=True)
 
 
 
@@ -176,7 +196,9 @@ class State:
     last_guild_id: str = ""
     last_channel_id: str = ""
     viewer_token: str = ""
+    streamer_id: str = ""
     auto_start: bool = False
+    auto_mode: int = 1
 
     @classmethod
     def load(cls) -> "State":
@@ -192,18 +214,25 @@ class State:
         if CONFIG_FILE.exists():
             try:
                 cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                if cfg.get("streamer_token"):
-                    inst.token = cfg["streamer_token"].strip()
-                elif cfg.get("token"):
-                    inst.token = cfg["token"].strip()
+                if "streamer_token" in cfg and cfg["streamer_token"] is not None:
+                    inst.token = str(cfg["streamer_token"]).strip()
+                elif "token" in cfg and cfg["token"] is not None:
+                    inst.token = str(cfg["token"]).strip()
                 if cfg.get("guild_id"):
                     inst.last_guild_id = str(cfg["guild_id"]).strip()
                 if cfg.get("channel_id"):
                     inst.last_channel_id = str(cfg["channel_id"]).strip()
-                if cfg.get("viewer_token"):
-                    inst.viewer_token = cfg["viewer_token"].strip()
+                if "viewer_token" in cfg and cfg["viewer_token"] is not None:
+                    inst.viewer_token = str(cfg["viewer_token"]).strip()
+                if cfg.get("streamer_id"):
+                    inst.streamer_id = str(cfg["streamer_id"]).strip()
                 if "auto_start" in cfg:
                     inst.auto_start = bool(cfg["auto_start"])
+                if "auto_mode" in cfg:
+                    try:
+                        inst.auto_mode = int(cfg["auto_mode"])
+                    except Exception:
+                        pass
             except Exception:
                 pass
         return inst
@@ -218,12 +247,17 @@ class State:
         existing.update(asdict(self))
         STATE_FILE.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
-        cfg = {
+        cfg: dict[str, Any] = {
             "streamer_token": self.token,
             "guild_id": self.last_guild_id,
             "channel_id": self.last_channel_id,
-            "viewer_token": self.viewer_token
+            "viewer_token": self.viewer_token,
         }
+        if self.streamer_id:
+            cfg["streamer_id"] = self.streamer_id
+        if self.auto_start:
+            cfg["auto_start"] = self.auto_start
+            cfg["auto_mode"] = self.auto_mode
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
     @property
@@ -238,6 +272,10 @@ class State:
     def has_token(self) -> bool:
         return bool(self.token.strip())
 
+    @property
+    def has_viewer_token(self) -> bool:
+        return bool(self.viewer_token.strip())
+
 
 def _local_props() -> dict:
     return {
@@ -251,12 +289,14 @@ def _local_props() -> dict:
         "system_locale": "en-US",
         "has_client_mods": False,
         "browser_user_agent": USER_AGENT,
-        "browser_version": "42.7.1",
-        "os_sdk_version": "26200",
+        "browser_version": "44.10.0",
+        "os_sdk_version": "26100",
         "client_build_number": CLIENT_BUILD_NUMBER,
         "native_build_number": NATIVE_BUILD_NUMBER,
         "client_event_source": None,
         "client_app_state": "focused",
+        "is_fast_connect": False,
+        "gateway_connect_reasons": "AppSkeleton",
     }
 
 
@@ -275,6 +315,8 @@ def build_super_props(launch_signature: str, heartbeat_session: str) -> tuple[st
     props["client_launch_id"] = str(uuid.uuid4())
     props["launch_signature"] = launch_signature
     props["client_heartbeat_session_id"] = heartbeat_session
+    props.setdefault("is_fast_connect", False)
+    props.setdefault("gateway_connect_reasons", "AppSkeleton")
     raw = json.dumps(props, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(raw).decode("ascii"), props
 
@@ -323,8 +365,6 @@ class Session:
 
 
 class MiniWebSocket:
-    """Pure stdlib websocket client (RFC 6455) for discord gateway communication."""
-
     def __init__(self, host: str, port: int = 443, path: str = "/") -> None:
         host_clean = host.replace("wss://", "").replace("https://", "").rstrip("/")
         if ":" in host_clean:
@@ -416,50 +456,52 @@ class MiniWebSocket:
             if not r:
                 return None
             head = self._recv_exact(2)
-        except Exception:
-            self.close()
-            return None
-
-        opcode = head[0] & 0x0F
-        if opcode == 0x8:
-            code = 0
-            reason = ""
-            try:
-                c_len = head[1] & 0x7F
-                if c_len >= 2:
-                    p = self._recv_exact(c_len)
-                    code = struct.unpack(">H", p[:2])[0]
-                    reason = p[2:].decode("utf-8", "ignore")
-            except Exception:
-                pass
-            self.close()
-            return {"op": "close", "code": code, "reason": reason}
-        if opcode == 0x9:
-            # Ping -> reply Pong
-            try:
-                with self._lock:
-                    if self.sock and not self.closed:
-                        pong = bytearray([0x8A, 0x80])
-                        pong.extend(os.urandom(4))
-                        self.sock.sendall(pong)
-            except Exception:
-                self.close()
-            return {"op": "ping"}
-
-        length = head[1] & 0x7F
-        try:
+            opcode = head[0] & 0x0F
+            length = head[1] & 0x7F
             if length == 126:
                 ext = self._recv_exact(2)
                 length = int.from_bytes(ext, "big")
             elif length == 127:
                 ext = self._recv_exact(8)
                 length = int.from_bytes(ext, "big")
-
-            payload = self._recv_exact(length)
-            return json.loads(payload.decode("utf-8"))
+            payload = self._recv_exact(length) if length > 0 else b""
         except Exception:
             self.close()
             return None
+
+        if opcode == 0x8:
+            code = 0
+            reason = ""
+            if len(payload) >= 2:
+                code = struct.unpack(">H", payload[:2])[0]
+                reason = payload[2:].decode("utf-8", "ignore")
+            self.close()
+            return {"op": "close", "code": code, "reason": reason}
+
+        if opcode == 0x9:
+            try:
+                with self._lock:
+                    if self.sock and not self.closed:
+                        plen = len(payload)
+                        mask_key = os.urandom(4)
+                        pong = bytearray([0x8A, 0x80 | plen])
+                        pong.extend(mask_key)
+                        pong.extend(payload[i] ^ mask_key[i % 4] for i in range(plen))
+                        self.sock.sendall(pong)
+            except Exception:
+                self.close()
+            return {"op": "ping"}
+
+        if opcode == 0xA:
+            return {"op": "pong"}
+
+        if opcode in (0x0, 0x2):
+            return {"op": "binary", "len": len(payload)}
+
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except Exception:
+            return {"op": "raw"}
 
     def close(self) -> None:
         self.closed = True
@@ -473,12 +515,6 @@ class MiniWebSocket:
 
 
 class VoiceConnection:
-    """
-    Manages a single voice WebSocket + UDP socket pair
-    Handles: identify → ready → IP discovery → select protocol →
-    session description → heartbeats → silent audio pump
-    """
-
     def __init__(
         self,
         endpoint: str,
@@ -527,7 +563,6 @@ class VoiceConnection:
         self._audio_thread: threading.Thread | None = None
 
     def connect(self) -> bool:
-        """Full voice handshake: WS → identify → ready → UDP → select protocol → session description."""
         C = self.console
 
         try:
@@ -540,6 +575,7 @@ class VoiceConnection:
         msg = self._recv_op(8, timeout=10)
         if not msg:
             C.err(self.label, "no Hello from voice server")
+            self.close()
             return False
         self.heartbeat_interval = msg.get("d", {}).get("heartbeat_interval", 13750) / 1000.0
 
@@ -562,6 +598,7 @@ class VoiceConnection:
         msg = self._recv_op(2, timeout=10)
         if not msg:
             C.err(self.label, "no Ready from voice server")
+            self.close()
             return False
 
         d = msg.get("d", {})
@@ -584,9 +621,9 @@ class VoiceConnection:
             self.encryption_mode = modes[0]
 
         if not self._udp_discovery():
-            C.warn(self.label, "UDP discovery failed, using fallback IP")
-            self.external_ip = "127.0.0.1"
-            self.external_port = random.randint(10000, 60000)
+            C.warn(self.label, "UDP IP discovery failed — aborting voice handshake to avoid invalid IP leak")
+            self.close()
+            return False
 
         self.ws.send(json.dumps({
             "op": 1,
@@ -610,7 +647,6 @@ class VoiceConnection:
         return True
 
     def _recv_op(self, target_op: int, timeout: float = 10) -> dict | None:
-        """Receive messages until we get the target opcode or timeout."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             remaining = max(0.1, deadline - time.time())
@@ -632,7 +668,6 @@ class VoiceConnection:
         return None
 
     def _send_heartbeat(self) -> None:
-        """Send voice heartbeat (op 3)."""
         if self.ws and not self.ws.closed:
             try:
                 nonce = int(time.time() * 1000)
@@ -641,55 +676,76 @@ class VoiceConnection:
                 pass
 
     def _udp_discovery(self) -> bool:
-        """Perform UDP IP discovery to find external IP and port."""
-        try:
-            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.udp_sock.settimeout(5)
+        for _ in range(3):
+            try:
+                if self.udp_sock:
+                    try:
+                        self.udp_sock.close()
+                    except Exception:
+                        pass
+                self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.udp_sock.settimeout(3.0)
 
-            # build 74-byte discovery request
-            # Type(2) = 0x0001, Length(2) = 70, SSRC(4), Address(64), Port(2)
-            packet = bytearray(74)
-            struct.pack_into(">HHI", packet, 0, 0x0001, 70, self.ssrc)
+                packet = bytearray(74)
+                struct.pack_into(">HHI", packet, 0, 0x0001, 70, self.ssrc)
 
-            self.udp_sock.sendto(bytes(packet), (self.voice_ip, self.voice_port))
+                self.udp_sock.sendto(bytes(packet), (self.voice_ip, self.voice_port))
 
-            data, _ = self.udp_sock.recvfrom(256)
-            if len(data) < 74:
-                return False
+                data, _ = self.udp_sock.recvfrom(256)
+                if len(data) < 74:
+                    continue
 
-            ip_start = 8
-            ip_end = data.index(0, ip_start)
-            self.external_ip = data[ip_start:ip_end].decode("utf-8")
-            self.external_port = struct.unpack_from(">H", data, 72)[0]
+                ip_start = 8
+                ip_end = data.index(0, ip_start)
+                self.external_ip = data[ip_start:ip_end].decode("utf-8")
+                self.external_port = struct.unpack_from(">H", data, 72)[0]
 
-            return bool(self.external_ip)
-        except Exception:
-            if self.udp_sock:
-                try:
-                    self.udp_sock.close()
-                except Exception:
-                    pass
-                self.udp_sock = None
-            return False
+                if self.external_ip and self.external_ip != "0.0.0.0":
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+        if self.udp_sock:
+            try:
+                self.udp_sock.close()
+            except Exception:
+                pass
+            self.udp_sock = None
+        return False
 
     def start_heartbeat(self) -> None:
-        """Start voice heartbeat loop in background thread."""
         def _loop():
+            last_hb = 0.0
             while self.running and self.ws and not self.ws.closed:
-                self._send_heartbeat()
+                now = time.time()
+                if now - last_hb >= max(2.0, self.heartbeat_interval - 0.5):
+                    self._send_heartbeat()
+                    last_hb = now
                 try:
-                    msg = self.ws.recv(timeout=0.5)
-                    if msg and msg.get("op") == 3:
-                        self._send_heartbeat()
+                    msg = self.ws.recv(timeout=1.0)
+                    if msg is None:
+                        if self.ws.closed:
+                            self.running = False
+                            break
+                        continue
+                    if isinstance(msg, dict):
+                        if msg.get("op") == "close":
+                            self.console.warn(self.label, f"voice ws closed: {msg.get('code')} ({msg.get('reason')})")
+                            self.running = False
+                            break
+                        if msg.get("op") == 8:
+                            self.heartbeat_interval = msg.get("d", {}).get("heartbeat_interval", 13750) / 1000.0
                 except Exception:
-                    pass
-                time.sleep(max(1.0, self.heartbeat_interval - 0.5))
+                    if not self.ws or self.ws.closed:
+                        self.running = False
+                        break
+            self.running = False
 
         self._hb_thread = threading.Thread(target=_loop, daemon=True)
         self._hb_thread.start()
 
     def send_speaking(self, speaking: bool = True) -> None:
-        """Send speaking state (op 5)."""
         if self.ws and not self.ws.closed:
             try:
                 self.ws.send(json.dumps({
@@ -703,8 +759,25 @@ class VoiceConnection:
             except Exception:
                 pass
 
+    def send_udp_keepalive_only(self) -> None:
+        if not self.udp_sock:
+            return
+
+        def _keepalive():
+            seq = 0
+            while self.running and self.udp_sock:
+                try:
+                    pkt = struct.pack(">I", seq) + b"\xc9"
+                    self.udp_sock.sendto(pkt, (self.voice_ip, self.voice_port))
+                    seq = (seq + 1) & 0xFFFF
+                except Exception:
+                    pass
+                time.sleep(random.uniform(4.5, 6.0))
+
+        self._audio_thread = threading.Thread(target=_keepalive, daemon=True)
+        self._audio_thread.start()
+
     def start_silence_pump(self) -> None:
-        """Pump silent Opus frames via UDP to keep the voice/stream session alive."""
         if not self.udp_sock or not self.secret_key:
             return
 
@@ -722,8 +795,8 @@ class VoiceConnection:
                         except Exception:
                             pass
                     seq = (seq + 1) & 0xFFFF
-                    ts = (ts + 960) & 0xFFFFFFFF  # 20ms at 48kHz
-                    time.sleep(1.0)  # pump every 1s to keep UDP NAT & SFU worker alive
+                    ts = (ts + 960) & 0xFFFFFFFF
+                    time.sleep(random.uniform(0.95, 1.15))
                 except Exception:
                     break
 
@@ -731,27 +804,24 @@ class VoiceConnection:
         self._audio_thread.start()
 
     def _send_encrypted_silence_gcm(self, seq: int, ts: int) -> None:
-        """Send AES-256-GCM encrypted silence packet."""
         if not self.udp_sock or not self.secret_key:
             return
         try:
             rtp_header = struct.pack(
                 ">BBHII",
-                0x80,       # version=2
-                0x78,       # payload type=120 (opus)
+                0x80,
+                0x78,
                 seq & 0xFFFF,
                 ts & 0xFFFFFFFF,
                 self.ssrc,
             )
 
-            # 12 byte nonce: 4 byte counter (big-endian) + 8 zero bytes
             self.nonce_counter += 1
             nonce = struct.pack(">I", self.nonce_counter) + b"\x00" * 8
 
             cipher = AESGCM(self.secret_key[:32])
             encrypted = cipher.encrypt(nonce, OPUS_SILENCE, rtp_header)
 
-            # packet = header + encrypted_audio + nonce_suffix (4 bytes)
             packet = rtp_header + encrypted + struct.pack(">I", self.nonce_counter)
             self.udp_sock.sendto(packet, (self.voice_ip, self.voice_port))
         except Exception:
@@ -764,6 +834,7 @@ class VoiceConnection:
                 self.udp_sock.close()
             except Exception:
                 pass
+            self.udp_sock = None
         if self.ws:
             self.ws.close()
 
@@ -776,21 +847,29 @@ class AutoViewer:
         self.console = console
         self.target_user_id = str(target_user_id).strip()
         self.user_id = _user_id_from_token(self.token)
+        self.session = Session.new()
         self.running = False
         self.ws: MiniWebSocket | None = None
         self.voice_conn: VoiceConnection | None = None
         self.thread: threading.Thread | None = None
         self.heartbeat_interval = 41.25
-        self.sequence = None
+        self.sequence: int | None = None
         self.session_id = ""
         self.voice_session_id = ""
         self.voice_token = ""
         self.voice_endpoint = ""
         self.voice_connected = False
-        self.stream_key = f"guild:{self.guild_id}:{self.channel_id}:{self.target_user_id}" if self.target_user_id else ""
+        self.default_stream_key = f"guild:{self.guild_id}:{self.channel_id}:{self.target_user_id}" if self.target_user_id else ""
+        self.stream_key = self.default_stream_key
+        self._watched_stream_key = ""
         self.is_watching = False
         self.watch_start_time = 0.0
+        self._last_watch_attempt = 0.0
         self.username = ""
+        self.conflict_paused = False
+        self._voice_join_times: list[float] = []
+        self._own_sessions: set[str] = set()
+        self._watch_lock = threading.Lock()
 
     def start(self, stream_key: str = "") -> None:
         if not self.token or self.running:
@@ -802,35 +881,65 @@ class AutoViewer:
         self.thread.start()
 
     def _send_voice_state_join(self) -> None:
-        if self.ws and not self.ws.closed:
-            try:
-                self.ws.send(json.dumps({
-                    "op": 4,
-                    "d": {
-                        "guild_id": self.guild_id,
-                        "channel_id": self.channel_id,
-                        "self_mute": True,
-                        "self_deaf": True,
-                    }
-                }))
-            except Exception:
-                pass
+        if not self.ws or self.ws.closed or not self.running:
+            return
+        now = time.time()
+        self._voice_join_times = [t for t in self._voice_join_times if now - t < 300.0]
+        if len(self._voice_join_times) >= 4:
+            cooldown = random.uniform(45.0, 75.0)
+            self.console.warn(
+                "anti-ban",
+                f"Защита от частых перезаходов в войс: пауза {cooldown:.0f} сек. для безопасности аккаунта..."
+            )
+            for _ in range(int(cooldown * 2)):
+                if not self.running or not self.ws or self.ws.closed:
+                    return
+                time.sleep(0.5)
+            self._voice_join_times.clear()
 
-    def _send_watch_stream(self) -> None:
-        if not self.stream_key or not self.ws or self.ws.closed:
+        self._voice_join_times.append(time.time())
+        try:
+            self.ws.send(json.dumps({
+                "op": 4,
+                "d": {
+                    "guild_id": self.guild_id,
+                    "channel_id": self.channel_id,
+                    "self_mute": True,
+                    "self_deaf": True,
+                    "self_video": False,
+                }
+            }))
+        except Exception:
+            pass
+
+    def _send_watch_stream(self, force: bool = False) -> None:
+        if not self.stream_key and self.default_stream_key:
+            self.stream_key = self.default_stream_key
+        if not self.stream_key or not self.ws or self.ws.closed or not self.voice_connected:
+            return
+        if not force and self.is_watching and self._watched_stream_key == self.stream_key:
+            return
+        if not self._watch_lock.acquire(blocking=False):
             return
         try:
+            self._last_watch_attempt = time.time()
+            time.sleep(random.uniform(0.6, 1.1))
+            if not self.stream_key or not self.ws or self.ws.closed or not self.voice_connected:
+                return
             self.ws.send(json.dumps({
                 "op": 20,
                 "d": {
                     "stream_key": self.stream_key
                 }
             }))
+            self._watched_stream_key = self.stream_key
             self.is_watching = True
             self.watch_start_time = time.time()
             self.console.live("alt-viewer", f"твинк смотрит трансляцию ({self.stream_key})")
         except Exception:
             pass
+        finally:
+            self._watch_lock.release()
 
     def _connect_voice_server(self, endpoint: str, token: str) -> None:
         C = self.console
@@ -844,7 +953,7 @@ class AutoViewer:
 
         self.voice_token = token
         self.voice_endpoint = endpoint
-        session_id = self.voice_session_id or self.session_id
+        session_id = self.session_id or self.voice_session_id
 
         self.voice_conn = VoiceConnection(
             endpoint=endpoint,
@@ -860,20 +969,37 @@ class AutoViewer:
         C.info(f"{C.CYAN}alt-voice{C.RESET} · подключение к голосовому серверу...")
         if self.voice_conn.connect():
             self.voice_conn.start_heartbeat()
-            self.voice_conn.send_speaking(False)
-            self.voice_conn.start_silence_pump()
+            self.voice_conn.send_udp_keepalive_only()
             self.voice_connected = True
             C.ok("alt-voice", f"твинк закреплён в голосовом канале (ssrc={self.voice_conn.ssrc})")
+            if not self.stream_key and self.default_stream_key:
+                self.stream_key = self.default_stream_key
             if self.stream_key:
-                time.sleep(0.5)
-                self._send_watch_stream()
+                threading.Thread(target=self._send_watch_stream, args=(True,), daemon=True).start()
             else:
                 C.ok("alt-viewer", "твинк в голосовом канале, ожидает запуск стрима...")
         else:
             C.warn("alt-voice", "не удалось установить связь с голосовым сервером твинка")
 
+    def _check_guild_active_streams(self, d: dict) -> None:
+        g_id = str(d.get("id", ""))
+        if g_id and g_id != self.guild_id:
+            return
+        voice_states = d.get("voice_states") or []
+        for vs in voice_states:
+            u_id = str(vs.get("user_id", ""))
+            ch_id = str(vs.get("channel_id", ""))
+            if ch_id == self.channel_id and vs.get("self_stream") and u_id and u_id != self.user_id:
+                self.stream_key = f"guild:{self.guild_id}:{self.channel_id}:{u_id}"
+                if self.voice_connected:
+                    threading.Thread(target=self._send_watch_stream, args=(True,), daemon=True).start()
+                break
+
     def _run(self) -> None:
         C = self.console
+        backoff = 4.0
+        can_resume = False
+
         while self.running:
             try:
                 C.info(f"{C.CYAN}alt-viewer{C.RESET} · подключение твинка к шлюзу Discord...")
@@ -889,13 +1015,46 @@ class AutoViewer:
                             self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
                             last_hb = now
                         except Exception:
+                            break
+
+                    if self.voice_connected and self.voice_conn and not self.voice_conn.running and not self.conflict_paused:
+                        C.warn("alt-voice", "голосовой сокет закрылся, выполняем плавный перезаход...")
+                        self.voice_connected = False
+                        self.is_watching = False
+                        self._watched_stream_key = ""
+                        try:
+                            self.voice_conn.close()
+                        except Exception:
                             pass
+                        self.voice_conn = None
+                        threading.Thread(target=self._send_voice_state_join, daemon=True).start()
+
+                    if (
+                        self.voice_connected
+                        and self.stream_key
+                        and not self.is_watching
+                        and not self.conflict_paused
+                        and (now - self._last_watch_attempt >= 15.0)
+                    ):
+                        threading.Thread(target=self._send_watch_stream, args=(True,), daemon=True).start()
 
                     msg = self.ws.recv(timeout=1.0)
                     if not msg:
                         continue
 
                     if isinstance(msg, dict) and msg.get("op") == "close":
+                        code = msg.get("code")
+                        reason = msg.get("reason", "")
+                        C.warn("alt-viewer", f"шлюз закрыл соединение (код {code}: {reason})")
+                        if code == 4004:
+                            C.err("alt-viewer", "КРИТИЧЕСКАЯ ОШИБКА (4004): Токен твинка недействителен или был сброшен! Остановка во избежание бана.")
+                            self.running = False
+                            return
+                        if code in (4010, 4011, 4012, 4013, 4014):
+                            C.err("alt-viewer", f"КРИТИЧЕСКАЯ ОШИБКА шлюза ({code}): остановка.")
+                            self.running = False
+                            return
+                        can_resume = True
                         break
 
                     op = msg.get("op")
@@ -910,32 +1069,57 @@ class AutoViewer:
                         self.heartbeat_interval = d.get("heartbeat_interval", 41250) / 1000.0
                         last_hb = time.time()
                         self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
-                        self.ws.send(json.dumps({
-                            "op": 2,
-                            "d": {
-                                "token": self.token,
-                                "capabilities": 16381,
-                                "properties": _local_props(),
-                                "presence": {
-                                    "status": "online",
-                                    "since": 0,
-                                    "activities": [],
-                                    "afk": False,
-                                },
-                            }
-                        }))
+
+                        if can_resume and self.session_id and self.sequence is not None:
+                            C.info(f"{C.CYAN}alt-viewer{C.RESET} · восстановление сессии (Op 6 Resume)...")
+                            self.ws.send(json.dumps({
+                                "op": 6,
+                                "d": {
+                                    "token": self.token,
+                                    "session_id": self.session_id,
+                                    "seq": self.sequence,
+                                }
+                            }))
+                        else:
+                            self.ws.send(json.dumps({
+                                "op": 2,
+                                "d": {
+                                    "token": self.token,
+                                    "capabilities": 16381,
+                                    "properties": self.session.props_dict,
+                                    "presence": {
+                                        "status": "online",
+                                        "since": 0,
+                                        "activities": [],
+                                        "afk": False,
+                                    },
+                                    "compress": False,
+                                    "client_state": _default_client_state(),
+                                }
+                            }))
                         identified = True
+                        backoff = 4.0
+
+                    elif op == 1:
+                        self.ws.send(json.dumps({"op": 1, "d": self.sequence}))
+                        last_hb = time.time()
 
                     elif op == 11:
                         last_hb = time.time()
 
                     elif op == 7:
-                        C.warn("alt-viewer", "запрошено переподключение к шлюзу...")
+                        C.warn("alt-viewer", "Discord запросил переподключение (Op 7 Reconnect)...")
+                        can_resume = True
                         break
 
                     elif op == 9:
-                        C.warn("alt-viewer", "сессия недействительна, повторный вход...")
-                        time.sleep(1.0)
+                        resumable = bool(d)
+                        C.warn("alt-viewer", f"сессия устарела (Op 9, resumable={resumable})...")
+                        can_resume = resumable
+                        if not resumable:
+                            self.session_id = ""
+                            self.sequence = None
+                        time.sleep(random.uniform(2.0, 4.5))
                         break
 
                     elif op == 0:
@@ -944,37 +1128,124 @@ class AutoViewer:
                             self.username = u.get("username", "alt")
                             self.user_id = str(u.get("id") or self.user_id)
                             self.session_id = d.get("session_id", "")
+                            if self.session_id:
+                                self._own_sessions.add(self.session_id)
+                            self.voice_session_id = self.session_id
+                            self.conflict_paused = False
                             C.ok("alt-viewer", f"твинк авторизован ({self.username})")
-                            self._send_voice_state_join()
+                            try:
+                                self.ws.send(json.dumps({
+                                    "op": 14,
+                                    "d": {
+                                        "guild_id": self.guild_id,
+                                        "typing": True,
+                                        "threads": False,
+                                        "activities": True,
+                                    }
+                                }))
+                            except Exception:
+                                pass
+                            for g in (d.get("guilds") or []):
+                                if isinstance(g, dict):
+                                    self._check_guild_active_streams(g)
+
+                            def _delayed_join():
+                                time.sleep(random.uniform(1.2, 2.2))
+                                if self.running and not self.conflict_paused:
+                                    self._send_voice_state_join()
+                            threading.Thread(target=_delayed_join, daemon=True).start()
+
+                        elif t == "READY_SUPPLEMENTAL":
+                            for g in (d.get("guilds") or []):
+                                if isinstance(g, dict):
+                                    self._check_guild_active_streams(g)
+
+                        elif t == "RESUMED":
+                            C.ok("alt-viewer", "сессия твинка успешно восстановлена (RESUMED)")
+                            if not self.voice_connected and not self.conflict_paused:
+                                threading.Thread(target=self._send_voice_state_join, daemon=True).start()
+
+                        elif t == "GUILD_CREATE":
+                            self._check_guild_active_streams(d)
 
                         elif t == "VOICE_STATE_UPDATE":
                             u_id = str(d.get("user_id", ""))
                             if u_id == self.user_id:
                                 active_ch = d.get("channel_id")
                                 sess = d.get("session_id", "")
+
+                                if sess and self.session_id and sess != self.session_id and sess not in self._own_sessions:
+                                    if active_ch is not None:
+                                        if not self.conflict_paused:
+                                            self.conflict_paused = True
+                                            self.voice_connected = False
+                                            self.is_watching = False
+                                            self._watched_stream_key = ""
+                                            if self.voice_conn:
+                                                self.voice_conn.close()
+                                                self.voice_conn = None
+                                            C.err(
+                                                "anti-ban",
+                                                "ОБНАРУЖЕН КОНФЛИКТ СЕССИЙ: Твинк подключён к войсу с другого устройства или VDS!"
+                                            )
+                                            C.warn(
+                                                "anti-ban",
+                                                "Локальный перезаход поставлен на паузу, чтобы Discord НЕ заблокировал аккаунт за борьбу сессий."
+                                            )
+                                        continue
+                                    else:
+                                        if self.conflict_paused:
+                                            C.ok("anti-ban", "Внешняя сессия твинка покинула войс. Возвращаемся через 10 сек...")
+                                            self.conflict_paused = False
+                                            def _rejoin_after_conflict():
+                                                time.sleep(random.uniform(9.0, 14.0))
+                                                if self.running and not self.conflict_paused:
+                                                    self._send_voice_state_join()
+                                            threading.Thread(target=_rejoin_after_conflict, daemon=True).start()
+                                        continue
+
+                                if sess and sess != self.session_id and sess in self._own_sessions:
+                                    continue
+
                                 if sess:
                                     self.voice_session_id = sess
+
                                 if active_ch is None:
+                                    if self.conflict_paused:
+                                        continue
                                     if self.voice_connected or self.is_watching:
-                                        C.warn("alt-viewer", "твинк был отключен от войса, выполняем перезаход...")
+                                        C.warn("alt-viewer", "твинк был отключен от войса, выполняем безопасный перезаход...")
                                     self.voice_connected = False
                                     self.is_watching = False
+                                    self._watched_stream_key = ""
                                     if self.voice_conn:
                                         self.voice_conn.close()
                                         self.voice_conn = None
                                     if self.running:
-                                        time.sleep(2.0)
-                                        self._send_voice_state_join()
-                            elif d.get("self_stream"):
-                                if not self.target_user_id or u_id == self.target_user_id:
-                                    ch = d.get("channel_id", self.channel_id)
-                                    self.stream_key = f"guild:{self.guild_id}:{ch}:{u_id}"
-                                    if self.voice_connected:
-                                        self._send_watch_stream()
+                                        def _safe_rejoin():
+                                            time.sleep(random.uniform(4.0, 7.0))
+                                            if self.running and not self.conflict_paused and not self.voice_connected:
+                                                self._send_voice_state_join()
+                                        threading.Thread(target=_safe_rejoin, daemon=True).start()
+                            else:
+                                ch = str(d.get("channel_id") or "")
+                                if d.get("self_stream") and ch == self.channel_id and u_id != self.user_id:
+                                    new_sk = f"guild:{self.guild_id}:{ch}:{u_id}"
+                                    if new_sk != self.stream_key or not self.is_watching:
+                                        self.stream_key = new_sk
+                                        if self.voice_connected:
+                                            threading.Thread(target=self._send_watch_stream, args=(True,), daemon=True).start()
+                                elif not d.get("self_stream") or ch != self.channel_id:
+                                    if self.stream_key and self.stream_key.endswith(f":{u_id}"):
+                                        self.stream_key = ""
+                                        self._watched_stream_key = ""
+                                        if self.is_watching:
+                                            self.is_watching = False
+                                            C.warn("alt-viewer", "стример завершил трансляцию, твинк ожидает в голосовом канале...")
 
                         elif t == "VOICE_SERVER_UPDATE":
                             v_guild = str(d.get("guild_id", ""))
-                            if v_guild == str(self.guild_id):
+                            if v_guild == str(self.guild_id) and not self.conflict_paused:
                                 token = d.get("token", "")
                                 endpoint = d.get("endpoint") or ""
                                 if endpoint and token:
@@ -982,21 +1253,23 @@ class AutoViewer:
 
                         elif t == "STREAM_CREATE":
                             sk = d.get("stream_key", "")
-                            if sk and (not self.target_user_id or self.target_user_id in sk):
+                            if sk and f":{self.channel_id}:" in sk and not sk.endswith(f":{self.user_id}"):
                                 self.stream_key = sk
                                 if self.voice_connected:
-                                    self._send_watch_stream()
+                                    threading.Thread(target=self._send_watch_stream, args=(True,), daemon=True).start()
 
                         elif t == "STREAM_DELETE":
                             del_sk = d.get("stream_key", "")
                             if not self.stream_key or del_sk == self.stream_key:
-                                self.is_watching = False
-                                C.warn("alt-viewer", "стрим остановлен, твинк ждёт перезапуска в канале...")
+                                self.stream_key = ""
+                                self._watched_stream_key = ""
+                                if self.is_watching:
+                                    self.is_watching = False
+                                    C.warn("alt-viewer", "стрим пока не активен или завершён, твинк ждёт запуска стрима в канале...")
 
             except Exception as exc:
                 if self.running:
-                    C.warn("alt-viewer", f"сбой соединения твинка: {exc}, повтор...")
-                    time.sleep(3.0)
+                    C.warn("alt-viewer", f"сбой соединения твинка: {exc}, повтор через {backoff:.0f}с...")
 
             if self.voice_conn:
                 try:
@@ -1006,6 +1279,7 @@ class AutoViewer:
                 self.voice_conn = None
             self.voice_connected = False
             self.is_watching = False
+            self._watched_stream_key = ""
             if self.ws:
                 try:
                     self.ws.close()
@@ -1013,12 +1287,15 @@ class AutoViewer:
                     pass
                 self.ws = None
             if self.running:
-                time.sleep(2.0)
+                sleep_t = backoff + random.uniform(0.5, 2.5)
+                time.sleep(sleep_t)
+                backoff = min(30.0, backoff * 1.5)
 
     def stop(self) -> None:
         self.running = False
         self.is_watching = False
         self.voice_connected = False
+        self._watched_stream_key = ""
         if self.voice_conn:
             try:
                 self.voice_conn.close()
@@ -1045,13 +1322,12 @@ class AutoViewer:
             self.ws = None
 
 
-PERMISSION_ADMINISTRATOR = 1 << 3       # 8
-PERMISSION_STREAM        = 1 << 9       # 512 (Go Live / Video)
-PERMISSION_VIEW_CHANNEL  = 1 << 10      # 1024
-PERMISSION_CONNECT       = 1 << 20      # 1048576
+PERMISSION_ADMINISTRATOR = 1 << 3
+PERMISSION_STREAM        = 1 << 9
+PERMISSION_VIEW_CHANNEL  = 1 << 10
+PERMISSION_CONNECT       = 1 << 20
 
 def _discord_api_get(url: str, token: str, super_props: str = "") -> tuple[int, dict]:
-    """Helper to perform GET request to Discord REST API."""
     headers = {
         "authorization": token,
         "user-agent": USER_AGENT,
@@ -1080,14 +1356,6 @@ def validate_stream_target(
     channel_id: str,
     console: Console,
 ) -> tuple[bool, str]:
-    """
-    Validates:
-    1. Snowflake ID formats (must be numeric 17-20 digits)
-    2. Token authentication (GET /users/@me)
-    3. Server existence & user membership (GET /guilds/{guild_id})
-    4. Voice channel existence, guild matching, and type (GET /channels/{channel_id})
-    5. User permissions in the voice channel: View Channel, Connect, and Stream (Go Live)
-    """
     C = console
 
     if not guild_id.isdigit():
@@ -1191,22 +1459,6 @@ def validate_stream_target(
 
 
 class GatewayStreamEngine:
-    """
-    Connects to Discord gateway, joins a vc, completes the
-    full voice websocket + UDP handshake, then initiates Go Live streaming
-
-    This is the ONLY method that actually works for streaming badge
-    accumulation: Discord tracks streaming time server-side via active
-    voice state + stream state on their SFU media workers
-
-    Architecture:
-        Main Gateway WS (wss://gateway.discord.gg/?v=9)
-            ├── Voice WS (wss://{voice_endpoint}/?v=7)
-            │   └── Voice UDP (ssrc, silence frames)
-            └── Stream WS (wss://{stream_endpoint}/?v=7)
-                └── Stream UDP (ssrc, silence frames)
-    """
-
     def __init__(self, state: State, session: Session, console: Console) -> None:
         self.state = state
         self.session = session
@@ -1251,7 +1503,8 @@ class GatewayStreamEngine:
         except Exception as exc:
             C.err("gateway", f"connection failed: {exc}")
             C.rule()
-            input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+            if not getattr(self.state, "auto_start", False) and sys.stdin.isatty():
+                input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
             return
 
         C.ok("gateway", "connected")
@@ -1290,11 +1543,9 @@ class GatewayStreamEngine:
             while self.running:
                 time.sleep(0.5)
 
-        # Cleanup
         self._cleanup(guild_id)
 
     def _status_display(self) -> None:
-        """Periodically display elapsed streaming time."""
         while self.running:
             time.sleep(60)
             if not self.running:
@@ -1310,7 +1561,9 @@ class GatewayStreamEngine:
                 status = f"{self.console.YELLOW}⏳ reconnecting{self.console.RESET}"
             viewer_str = ""
             if self.auto_viewer:
-                if self.auto_viewer.is_watching:
+                if self.auto_viewer.conflict_paused:
+                    viewer_str = f" · {self.console.RED}твинк на паузе (конфликт сессий){self.console.WHITE}"
+                elif self.auto_viewer.is_watching:
                     viewer_str = f" · {self.console.CYAN}твинк смотрит{self.console.WHITE}"
                 elif self.auto_viewer.voice_connected:
                     viewer_str = f" · {self.console.GREY}твинк в войсе{self.console.WHITE}"
@@ -1322,10 +1575,6 @@ class GatewayStreamEngine:
             )
 
     def _reconnect(self, guild_id: str, channel_id: str, can_resume: bool = True) -> bool:
-        """
-        cleanly reconnects to Discord Gateway and re-establishes voice + Go Live stream
-        maintains continuous stream elapsed time across drops
-        """
         C = self.console
         if not self.running:
             return False
@@ -1358,7 +1607,7 @@ class GatewayStreamEngine:
             self.ws = None
 
         attempts = 0
-        backoff = 3
+        backoff = 4
         while self.running:
             attempts += 1
             C.warn("gateway", f"reconnecting to gateway in {backoff}s (attempt {attempts})...")
@@ -1376,10 +1625,9 @@ class GatewayStreamEngine:
                     m = self.ws.recv(timeout=1.0)
                     if isinstance(m, dict) and m.get("op") == "close":
                         code = m.get("code")
-                        reason = m.get("reason", "")
                         if code == 4004:
                             C.err("auth", "fatal gateway authentication failure (code 4004: invalid token)")
-                            C.err("auth", "please use Option 3 in the menu to update your token.")
+                            C.err("auth", "please use Option 4 in the menu to update your token.")
                             self.running = False
                             return False
                     if m and m.get("op") == 10:
@@ -1391,7 +1639,7 @@ class GatewayStreamEngine:
                     C.warn("gateway", "did not receive hello from gateway, retrying...")
                     self.ws.close()
                     self.ws = None
-                    backoff = min(15, backoff + 2)
+                    backoff = min(20, backoff + 3)
                     continue
 
                 d_hello = hello_msg.get("d", {})
@@ -1421,7 +1669,7 @@ class GatewayStreamEngine:
                                 resumed = True
                             elif op_res == 9:
                                 C.warn("gateway", "resume failed (invalid session), falling back to identify")
-                                time.sleep(1.0)
+                                time.sleep(random.uniform(1.5, 3.0))
                             elif op_res == 0 and t_res == "READY":
                                 self._handle_dispatch("READY", res_msg.get("d", {}), guild_id, channel_id)
                                 resumed = True
@@ -1442,6 +1690,8 @@ class GatewayStreamEngine:
                                 "activities": [],
                                 "afk": False,
                             },
+                            "compress": False,
+                            "client_state": _default_client_state(),
                         },
                     }))
 
@@ -1450,7 +1700,7 @@ class GatewayStreamEngine:
                         code = test_msg.get("code")
                         if code == 4004:
                             C.err("auth", "fatal gateway authentication failure (code 4004: invalid token)")
-                            C.err("auth", "please use Option 3 in the menu to update your token.")
+                            C.err("auth", "please use Option 4 in the menu to update your token.")
                             self.running = False
                             return False
                     elif isinstance(test_msg, dict) and test_msg.get("op") == 0 and test_msg.get("t") == "READY":
@@ -1458,6 +1708,7 @@ class GatewayStreamEngine:
                         resumed = True
 
                 if resumed:
+                    time.sleep(random.uniform(1.5, 2.8))
                     self.ws.send(json.dumps({
                         "op": 4,
                         "d": {
@@ -1478,12 +1729,11 @@ class GatewayStreamEngine:
                 if self.ws:
                     self.ws.close()
                     self.ws = None
-                backoff = min(15, backoff + 2)
+                backoff = min(20, backoff + 3)
 
         return False
 
     def _event_loop(self, guild_id: str, channel_id: str) -> None:
-        """Main gateway event loop — handles all opcodes and dispatched events."""
         last_hb = time.time()
 
         while self.running:
@@ -1508,6 +1758,34 @@ class GatewayStreamEngine:
                             last_hb = time.time()
                             continue
 
+                if self.voice_connected and self.voice_conn and not self.voice_conn.running and not self._user_left_vc:
+                    self.console.warn("voice", "voice WebSocket dropped, re-joining voice channel...")
+                    self.voice_connected = False
+                    self.stream_connected = False
+                    try:
+                        self.voice_conn.close()
+                    except Exception:
+                        pass
+                    self.voice_conn = None
+                    if self.stream_conn:
+                        try:
+                            self.stream_conn.close()
+                        except Exception:
+                            pass
+                        self.stream_conn = None
+                    time.sleep(random.uniform(2.0, 4.0))
+                    if self.running and self.ws and not self.ws.closed:
+                        self.ws.send(json.dumps({
+                            "op": 4,
+                            "d": {
+                                "guild_id": guild_id,
+                                "channel_id": channel_id,
+                                "self_mute": False,
+                                "self_deaf": False,
+                                "self_video": False,
+                            },
+                        }))
+
                 msg = self.ws.recv(timeout=1.0)
                 if not msg:
                     continue
@@ -1518,7 +1796,7 @@ class GatewayStreamEngine:
                     self.console.warn("gateway", f"gateway closed connection (code {code}: {reason})")
                     if code == 4004:
                         self.console.err("auth", "fatal: gateway authentication failed (code 4004: invalid token)")
-                        self.console.err("auth", "please use Option 3 in the menu to update your token.")
+                        self.console.err("auth", "please use Option 4 in the menu to update your token.")
                         self.running = False
                         break
                     elif code in (4010, 4011, 4012, 4013, 4014):
@@ -1557,6 +1835,8 @@ class GatewayStreamEngine:
                                 "activities": [],
                                 "afk": False,
                             },
+                            "compress": False,
+                            "client_state": _default_client_state(),
                         },
                     }))
 
@@ -1570,6 +1850,7 @@ class GatewayStreamEngine:
                 elif op == 0:
                     if t == "RESUMED":
                         self.console.ok("gateway", "gateway session resumed successfully")
+                        time.sleep(random.uniform(1.5, 2.5))
                         self.ws.send(json.dumps({
                             "op": 4,
                             "d": {
@@ -1605,7 +1886,6 @@ class GatewayStreamEngine:
                 last_hb = time.time()
 
     def _handle_dispatch(self, event_type: str, d: dict, guild_id: str, channel_id: str) -> None:
-        """Handle dispatched gateway events (op 0)."""
         C = self.console
 
         if event_type == "READY":
@@ -1615,6 +1895,7 @@ class GatewayStreamEngine:
             self.user_id = str(user_data.get("id", self.user_id))
             C.ok("auth", f"gateway authenticated ({username})")
 
+            time.sleep(random.uniform(2.0, 3.5))
             self.ws.send(json.dumps({
                 "op": 4,
                 "d": {
@@ -1694,7 +1975,7 @@ class GatewayStreamEngine:
                 self.voice_connected = True
                 C.ok("voice", f"{C.GREEN}voice connection established (ssrc={self.voice_conn.ssrc}){C.RESET}")
 
-                time.sleep(0.5)
+                time.sleep(random.uniform(1.8, 3.2))
                 C.info("requesting Go Live stream (op 18 Stream Create)...")
                 try:
                     self.ws.send(json.dumps({
@@ -1709,9 +1990,9 @@ class GatewayStreamEngine:
                 except Exception as exc:
                     C.warn("stream", f"stream create send error: {exc}")
             else:
-                C.err("voice", "voice WebSocket handshake FAILED, retrying in 3s...")
+                C.err("voice", "voice WebSocket handshake FAILED, retrying in 5s...")
                 def _retry_voice():
-                    time.sleep(3.0)
+                    time.sleep(random.uniform(4.5, 6.5))
                     if self.running and self.ws and not self.ws.closed:
                         try:
                             self.ws.send(json.dumps({
@@ -1732,7 +2013,13 @@ class GatewayStreamEngine:
             self.stream_key = d.get("stream_key", "")
             C.ok("stream", f"Go Live created! stream_key: {C.CYAN}{self.stream_key}{C.RESET}")
             if self.state.viewer_token and not self.auto_viewer:
-                self.auto_viewer = AutoViewer(self.state.viewer_token, guild_id, channel_id, self.console)
+                self.auto_viewer = AutoViewer(
+                    self.state.viewer_token,
+                    guild_id,
+                    channel_id,
+                    self.console,
+                    target_user_id=self.user_id,
+                )
                 self.auto_viewer.start(self.stream_key)
 
             self.stream_connected = True
@@ -1802,9 +2089,9 @@ class GatewayStreamEngine:
 
             if self._stream_recreate_attempts < 3:
                 self._stream_recreate_attempts += 1
-                C.warn("stream", f"stream stopped by server, re-requesting Go Live in 2s (attempt {self._stream_recreate_attempts}/3)...")
+                C.warn("stream", f"stream stopped by server, re-requesting Go Live in 4s (attempt {self._stream_recreate_attempts}/3)...")
                 def _recreate():
-                    time.sleep(2.0)
+                    time.sleep(random.uniform(3.5, 5.5))
                     if self.running and self.ws and not self.ws.closed and self.voice_connected and not self._user_left_vc:
                         try:
                             self.ws.send(json.dumps({
@@ -1829,9 +2116,15 @@ class GatewayStreamEngine:
                 C.info(f"voice connection status: {status}")
 
     def _cleanup(self, guild_id: str) -> None:
-        """Graceful shutdown: stop stream, leave voice, close connections."""
         C = self.console
         self.running = False
+
+        if self.auto_viewer:
+            try:
+                self.auto_viewer.stop()
+            except Exception:
+                pass
+            self.auto_viewer = None
 
         if self.ws and not self.ws.closed and self.stream_key:
             try:
@@ -1859,11 +2152,14 @@ class GatewayStreamEngine:
 
         if self.stream_conn:
             self.stream_conn.close()
+            self.stream_conn = None
         if self.voice_conn:
             self.voice_conn.close()
+            self.voice_conn = None
         if self.ws:
             time.sleep(0.3)
             self.ws.close()
+            self.ws = None
 
         if (self.stream_connected or self.stream_ever_active) and self.start_time > 0:
             elapsed = time.time() - self.start_time
@@ -1880,26 +2176,28 @@ class GatewayStreamEngine:
             C.info("stream session ended.")
 
         C.rule()
-        input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
+        if not getattr(self.state, "auto_start", False) and sys.stdin.isatty():
+            input(f"  {C.ORANGE}›{C.RESET} press enter to return to menu")
 
 
 
 def inspect_profile(state: State, session: Session, console: Console) -> None:
     C = console
-    if not state.has_token:
+    active_tok = state.token or state.viewer_token
+    if not active_tok:
         C.err("auth", "no token saved")
         C.rule()
         input(f"  {C.ORANGE}›{C.RESET} press enter to continue")
         return
 
     C.info("fetching profile data from discord...")
-    uid = _user_id_from_token(state.token)
+    uid = state.streamer_id or _user_id_from_token(state.token) or _user_id_from_token(active_tok)
     if not uid:
         try:
             req_me = urllib.request.Request(
                 ME_URL,
                 headers={
-                    "authorization": state.token,
+                    "authorization": active_tok,
                     "user-agent": USER_AGENT,
                     "x-super-properties": session.super_props,
                 },
@@ -1919,7 +2217,7 @@ def inspect_profile(state: State, session: Session, console: Console) -> None:
     req = urllib.request.Request(
         url,
         headers={
-            "authorization": state.token,
+            "authorization": active_tok,
             "user-agent": USER_AGENT,
             "x-super-properties": session.super_props,
         },
@@ -1963,36 +2261,41 @@ class StreamMaximizerApp:
         C.banner()
         time.sleep(0.3)
 
-        if not self.state.has_token:
-            self._prompt_token()
-        else:
-            C.ok("auth", "token loaded from state")
-        if not self.state.has_token:
-            C.err("token", "required to run")
-            return
-
-        # cookie check bypassed
-
-        C.info("validating session...")
         self._new_session()
-        try:
-            ensure_token(self.state, self.session.super_props)
-            C.ok("auth", "ready · analytics token cached")
-        except Exception as exc:
-            C.err("auth", str(exc))
-            return
+
+        if self.state.has_token:
+            C.ok("auth", "streamer_token loaded from config")
+            C.info("validating session...")
+            try:
+                ensure_token(self.state, self.session.super_props)
+                C.ok("auth", "ready · analytics token cached")
+            except Exception as exc:
+                C.warn("auth", f"streamer_token check failed ({exc})")
+        elif self.state.viewer_token:
+            C.ok("auth", "Режим безопасности основы: задан только viewer_token (основной аккаунт не используется в боте)")
+        else:
+            C.info("Токены не найдены в config.json. Вы можете ввести токен основы (Режим 1) или пропустить (Enter) для Режима 2 (Только Твинк):")
+            self._prompt_token()
 
         if HAS_CRYPTO:
             C.ok("crypto", "cryptography library available (encrypted audio enabled)")
         else:
             C.warn("crypto", "cryptography not installed · pip install cryptography for audio frames")
 
-        if getattr(self.state, "auto_start", False) or "--auto" in sys.argv:
+        if getattr(self.state, "auto_start", False) or "--auto" in sys.argv or "--viewer-only" in sys.argv:
+            mode = getattr(self.state, "auto_mode", 1)
+            if "--viewer-only" in sys.argv or (not self.state.has_token and self.state.viewer_token):
+                mode = 2
             if self.state.last_guild_id and self.state.last_channel_id:
-                C.ok("auto", f"auto-start active · streaming to guild {self.state.last_guild_id} channel {self.state.last_channel_id}")
-                engine = GatewayStreamEngine(self.state, self.session, self.console)
-                engine.start_stream(self.state.last_guild_id, self.state.last_channel_id)
-                return
+                if mode == 2:
+                    C.ok("auto", f"auto-start (Режим 2: Только Твинк-Зритель) · сервер {self.state.last_guild_id} канал {self.state.last_channel_id}")
+                    self.run_standalone_alt_viewer(auto_run=True)
+                    return
+                else:
+                    C.ok("auto", f"auto-start (Режим 1: Авто-Стрим + Твинк) · сервер {self.state.last_guild_id} канал {self.state.last_channel_id}")
+                    engine = GatewayStreamEngine(self.state, self.session, self.console)
+                    engine.start_stream(self.state.last_guild_id, self.state.last_channel_id)
+                    return
             else:
                 C.warn("auto", "auto_start requested but guild_id or channel_id missing")
 
@@ -2003,8 +2306,8 @@ class StreamMaximizerApp:
         self.session = Session.new()
 
     def _prompt_token(self) -> None:
-        self.console.info("paste your discord account token")
-        entered = input(f"  {self.console.GREY}token:{self.console.RESET} ").strip()
+        self.console.info("Вставьте токен основы (streamer_token) или нажмите Enter, чтобы использовать только твинк:")
+        entered = input(f"  {self.console.GREY}streamer_token:{self.console.RESET} ").strip()
         if entered:
             self.state.token = entered
             self.state.save()
@@ -2020,33 +2323,45 @@ class StreamMaximizerApp:
 
     def _refresh(self) -> None:
         C = self.console
-        C.info("paste updated token (or leave empty to keep current):")
-        tok = input(f"  {C.GREY}token:{C.RESET} ").strip()
+        C.info("Вставьте новый streamer_token (или Enter чтобы оставить текущий):")
+        tok = input(f"  {C.GREY}streamer_token:{C.RESET} ").strip()
         if tok:
             self.state.token = tok
-            C.ok("token", "updated")
+            C.ok("token", "streamer_token обновлён")
 
-        C.info("paste fresh cf_clearance cookie (or leave empty to keep current):")
-        ck = input(f"  {C.GREY}cookie:{C.RESET} ").strip()
-        if ck:
-            self.state.cookie = ck
-            C.ok("cookie", "updated")
+        C.info("Вставьте новый viewer_token твинка (или Enter чтобы оставить текущий):")
+        vtok = input(f"  {C.GREY}viewer_token:{C.RESET} ").strip()
+        if vtok:
+            self.state.viewer_token = vtok
+            C.ok("token", "viewer_token твинка обновлён")
 
-        C.info("refreshing analytics token...")
-        try:
-            self.state.fetched_at = 0
-            ensure_token(self.state, self.session.super_props)
-            self._new_session()
-            self.state.save()
-            C.ok("auth", "refreshed successfully")
-        except Exception as exc:
-            C.err("auth", str(exc))
+        C.info("ID основного аккаунта streamer_id (опционально для Режима 2 без токена основы, Enter чтобы пропустить):")
+        sid = input(f"  {C.GREY}streamer_id [{self.state.streamer_id}]:{C.RESET} ").strip()
+        if sid:
+            self.state.streamer_id = sid
+
+        self.state.save()
+        if self.state.has_token:
+            C.info("refreshing analytics token...")
+            try:
+                self.state.fetched_at = 0
+                ensure_token(self.state, self.session.super_props)
+                self._new_session()
+                self.state.save()
+                C.ok("auth", "refreshed successfully")
+            except Exception as exc:
+                C.err("auth", str(exc))
         time.sleep(1)
 
     def run_gateway_live_streamer(self) -> None:
-        """Start a headless Go Live stream in a voice channel."""
         C = self.console
         C.rule()
+
+        if not self.state.has_token:
+            C.warn("auth", "Для Режима 1 требуется токен аккаунта-стримера (streamer_token).")
+            self._prompt_token()
+            if not self.state.has_token:
+                return
 
         C.info(f"{C.CYAN}Streaming Badge Tiers:{C.RESET}")
         for tier, name, req_hours in STREAM_TIERS:
@@ -2060,6 +2375,7 @@ class StreamMaximizerApp:
         print()
         C.warn("rule 1", f"An alt or friend {C.YELLOW}MUST sit in the voice channel{C.RESET} - solo streams with 0 viewers do NOT count!")
         C.warn("rule 2", f"Discord Settings → Data & Privacy → {C.YELLOW}'Personalize my experience'{C.RESET} must be {C.GREEN}ON{C.RESET}!")
+        C.warn("anti-ban", f"{C.RED}НЕ запускайте один и тот же токен одновременно на ПК и на VDS!{C.RESET}")
         print()
 
         while True:
@@ -2096,18 +2412,21 @@ class StreamMaximizerApp:
         engine = GatewayStreamEngine(self.state, self.session, self.console)
         engine.start_stream(guild_id, channel_id)
 
-    def run_standalone_alt_viewer(self) -> None:
-        """Run only the alt account as a watcher while user streams from Discord desktop app."""
+    def run_standalone_alt_viewer(self, auto_run: bool = False) -> None:
         C = self.console
         C.rule()
-        C.info(f"{C.CYAN}Режим Авто-Зрителя (Твинк-бот){C.RESET}")
-        C.info("Этот режим подключает только ваш твинк в голосовой канал.")
-        C.info("Вы можете сидеть в войсе и стримить сами со своего официального Discord клиента,")
+        C.info(f"{C.CYAN}Режим Авто-Зрителя (Твинк-бот · 100% безопасность основы){C.RESET}")
+        C.info("Этот режим подключает ТОЛЬКО ваш твинк в голосовой канал.")
+        C.info("Вы можете стримить сами со своего официального Discord клиента без ввода токена основы,")
         C.info("а твинк будет сидеть рядом и смотреть трансляцию 24/7 (часы идут в зачёт).")
+        C.warn("anti-ban", f"{C.RED}ВАЖНО: Не запускайте один и тот же твинк одновременно на ПК и на VDS!{C.RESET}")
         C.rule()
         print()
 
         if not self.state.viewer_token:
+            if auto_run:
+                C.err("auth", "viewer_token отсутствует в config.json для auto_start")
+                return
             C.warn("auth", "Токен твинка не найден в конфигурации.")
             C.info("Вставьте токен вашего второго аккаунта (твинка):")
             entered = input(f"  {C.GREY}viewer_token:{C.RESET} ").strip()
@@ -2118,8 +2437,12 @@ class StreamMaximizerApp:
             self.state.viewer_token = entered
             self.state.save()
 
-        guild_id = input(f"  {C.GREY}ID сервера [{self.state.last_guild_id}] (Enter чтобы использовать):{C.RESET} ").strip() or self.state.last_guild_id
-        channel_id = input(f"  {C.GREY}ID голосового канала [{self.state.last_channel_id}] (Enter чтобы использовать):{C.RESET} ").strip() or self.state.last_channel_id
+        if auto_run:
+            guild_id = self.state.last_guild_id
+            channel_id = self.state.last_channel_id
+        else:
+            guild_id = input(f"  {C.GREY}ID сервера [{self.state.last_guild_id}] (Enter чтобы использовать):{C.RESET} ").strip() or self.state.last_guild_id
+            channel_id = input(f"  {C.GREY}ID голосового канала [{self.state.last_channel_id}] (Enter чтобы использовать):{C.RESET} ").strip() or self.state.last_channel_id
 
         if not guild_id or not channel_id:
             C.err("input", "ID сервера и канала обязательны.")
@@ -2130,13 +2453,13 @@ class StreamMaximizerApp:
         self.state.last_channel_id = channel_id
         self.state.save()
 
-        target_uid = _user_id_from_token(self.state.token)
+        target_uid = self.state.streamer_id or _user_id_from_token(self.state.token)
         viewer = AutoViewer(self.state.viewer_token, guild_id, channel_id, self.console, target_user_id=target_uid)
         viewer.start()
 
         print()
         C.rule()
-        C.ok("status", "Твинк запущен в фоновом режиме.")
+        C.ok("status", "Твинк запущен в защищённом режиме (Anti-Ban v2.0).")
         C.info("Теперь вы можете запустить стрим в Discord клиенте.")
         C.info(f"Нажмите {C.ORANGE}[Enter]{C.WHITE} в любой момент, чтобы остановить твинка и выйти в меню.")
         C.rule()
@@ -2160,7 +2483,9 @@ class StreamMaximizerApp:
                 if now - last_status_t >= 30.0:
                     last_status_t = now
                     elapsed_m = int((now - start_t) / 60)
-                    if viewer.is_watching:
+                    if viewer.conflict_paused:
+                        st = f"{C.RED}⏸ Пауза Anti-Ban (аккаунт в войсе с другого устройства/VDS){C.WHITE}"
+                    elif viewer.is_watching:
                         st = f"{C.GREEN}👁 Смотрит стрим{C.WHITE}"
                     elif viewer.voice_connected:
                         st = f"{C.CYAN}🔊 В голосовом канале (ждёт стрим){C.WHITE}"
@@ -2183,7 +2508,7 @@ class StreamMaximizerApp:
             C.info(f"total stream hours: {C.ORANGE}{self.state.total_stream_hours_claimed:,.1f}h{C.WHITE} ({self.state.total_stream_sessions} sessions)")
             C.rule()
             C.info(f"{C.ORANGE}1{C.RESET} · {C.MAGENTA}Авто-Стрим + Твинк{C.RESET} (Headless вещание с основы 0% CPU/GPU + авто-зритель)")
-            C.info(f"{C.ORANGE}2{C.RESET} · {C.CYAN}Только Твинк-Зритель{C.RESET} (Вы стримите сами в Discord, твинк смотрит)")
+            C.info(f"{C.ORANGE}2{C.RESET} · {C.CYAN}Только Твинк-Зритель{C.RESET} (100% без риска для основы: вы стримите сами в Discord, твинк смотрит)")
             C.info(f"{C.ORANGE}3{C.RESET} · Проверить профиль и статистику значков")
             C.info(f"{C.ORANGE}4{C.RESET} · Обновить токены и настройки авторизации")
             C.info(f"{C.ORANGE}5{C.RESET} · Выход")

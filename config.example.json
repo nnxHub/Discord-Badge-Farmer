@@ -3,6 +3,8 @@
   "guild_id": "",
   "channel_id": "",
   "viewer_token": "",
-  "auto_start": true
+  "streamer_id": "",
+  "auto_start": false,
+  "auto_mode": 1
 }
 
