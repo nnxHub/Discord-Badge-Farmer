@@ -839,6 +839,143 @@ class VoiceConnection:
             self.ws.close()
 
 
+class ScienceTelemetry:
+    def __init__(self, token: str, console: Console, turbo: bool = False):
+        self.token = token.strip()
+        self.console = console
+        self.turbo = turbo
+        self.analytics_token = ""
+        self.stream_start_time = 0.0
+        self.heartbeat_session_id = ""
+        self.launch_signature = ""
+        self.sequence = random.randint(1000, 50000)
+        self.running = False
+        self._thread: threading.Thread | None = None
+        self.credited_hours = 0.0
+
+    def fetch_analytics_token(self) -> str:
+        if self.analytics_token:
+            return self.analytics_token
+        req = urllib.request.Request(ME_URL, headers={
+            "authorization": self.token,
+            "user-agent": USER_AGENT,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                self.analytics_token = data.get("analytics_token", "")
+        except Exception:
+            pass
+        return self.analytics_token
+
+    def post_events(self, events: list[dict]) -> bool:
+        token = self.fetch_analytics_token()
+        if not token:
+            return False
+        now = int(time.time() * 1000)
+        payload = {
+            "token": token,
+            "events": [
+                {
+                    "type": ev["type"],
+                    "properties": {
+                        "client_track_timestamp": now,
+                        "client_send_timestamp": now,
+                        "client_heartbeat_session_id": self.heartbeat_session_id,
+                        "launch_signature": self.launch_signature,
+                        "event_sequence_number": self._next_seq(),
+                        "client_app_state": "focused",
+                        **ev.get("properties", {}),
+                    },
+                }
+                for ev in events
+            ],
+        }
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            SCIENCE_URL,
+            data=data_bytes,
+            headers={
+                "authorization": self.token,
+                "content-type": "application/json",
+                "origin": "https://discord.com",
+                "referer": "https://discord.com/channels/@me",
+                "user-agent": USER_AGENT,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status in (200, 204)
+        except Exception:
+            return False
+
+    def _next_seq(self) -> int:
+        self.sequence += 1
+        return self.sequence
+
+    def start_stream(self, guild_id: str, channel_id: str) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.stream_start_time = time.time()
+        self.heartbeat_session_id = str(uuid.uuid4())
+        self.launch_signature = str(uuid.uuid4())
+        props = {"guild_id": str(guild_id), "channel_id": str(channel_id), "channel_type": 2}
+        self.post_events([
+            {"type": "media_session_joined", "properties": props},
+            {"type": "video_stream_started", "properties": props},
+        ])
+        mode_str = "Turbo (+5ч/мин)" if self.turbo else "Real-Time (1:1)"
+        self.console.ok("science", f"телеметрия стриминга Discord активирована ({mode_str})")
+
+        def _loop():
+            while self.running:
+                time.sleep(60.0)
+                if not self.running:
+                    break
+                if self.turbo:
+                    claim_hours = 5.0
+                    self.credited_hours += claim_hours
+                    duration_tracked_ms = int(claim_hours * 3600000)
+                    total_duration_ms = int(self.credited_hours * 3600000)
+                else:
+                    self.credited_hours += (1.0 / 60.0)
+                    duration_tracked_ms = 60000
+                    total_duration_ms = int((time.time() - self.stream_start_time) * 1000)
+
+                ok = self.post_events([
+                    {
+                        "type": "video_stream_heartbeat",
+                        "properties": {
+                            "guild_id": str(guild_id),
+                            "channel_id": str(channel_id),
+                            "channel_type": 2,
+                            "duration_tracked_ms": duration_tracked_ms,
+                            "total_duration_ms": total_duration_ms,
+                        },
+                    }
+                ])
+                if ok:
+                    self.console.live("science", f"heartbeat аналитики отправлен (учтено: {self.credited_hours:.1f}ч)")
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def stop_stream(self, guild_id: str, channel_id: str) -> None:
+        if not self.running:
+            return
+        self.running = False
+        duration_ms = int((time.time() - self.stream_start_time) * 1000) if self.stream_start_time else 0
+        props = {
+            "guild_id": str(guild_id),
+            "channel_id": str(channel_id),
+            "channel_type": 2,
+            "duration_ms": duration_ms,
+        }
+        self.post_events([{"type": "video_stream_ended", "properties": props}])
+        self.console.info(f"{self.console.CYAN}science{self.console.RESET} · телеметрия стрима завершена")
+
+
 class AutoViewer:
     def __init__(self, token: str, guild_id: str, channel_id: str, console: Console, target_user_id: str = ""):
         self.token = token.strip()
@@ -870,6 +1007,10 @@ class AutoViewer:
         self._voice_join_times: list[float] = []
         self._own_sessions: set[str] = set()
         self._watch_lock = threading.Lock()
+        self.stream_rtc_ws: MiniWebSocket | None = None
+        self.stream_rtc_connected = False
+        self.stream_rtc_server_id = ""
+        self._stream_hb_thread: threading.Thread | None = None
 
     def start(self, stream_key: str = "") -> None:
         if not self.token or self.running:
@@ -980,6 +1121,95 @@ class AutoViewer:
                 C.ok("alt-viewer", "твинк в голосовом канале, ожидает запуск стрима...")
         else:
             C.warn("alt-voice", "не удалось установить связь с голосовым сервером твинка")
+
+    def _connect_stream_rtc(self, endpoint: str, token: str) -> None:
+        C = self.console
+        self._close_stream_rtc()
+        if not endpoint or not token:
+            return
+        cleaned = endpoint.replace("wss://", "").replace("https://", "").rstrip("/")
+        if ":" in cleaned:
+            host, port_str = cleaned.split(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                port = 443
+        else:
+            host = cleaned
+            port = 443
+
+        try:
+            ws = MiniWebSocket(host, port=port, path="/?v=8")
+            ws.connect()
+            self.stream_rtc_ws = ws
+
+            hello = ws.recv(timeout=5)
+            if not hello or hello.get("op") != 8:
+                self._close_stream_rtc()
+                return
+            hb_interval = hello.get("d", {}).get("heartbeat_interval", 13750) / 1000.0
+
+            rtc_server_id = self.stream_rtc_server_id or self.guild_id
+            session_id = self.session_id or self.voice_session_id
+            identify = {
+                "op": 0,
+                "d": {
+                    "server_id": rtc_server_id,
+                    "user_id": self.user_id,
+                    "session_id": session_id,
+                    "token": token,
+                    "video": True,
+                    "max_dave_protocol_version": 1,
+                    "streams": [
+                        {
+                            "type": "video",
+                            "rid": "100",
+                            "quality": 100,
+                        }
+                    ],
+                },
+            }
+            ws.send(json.dumps(identify))
+            ready = ws.recv(timeout=5)
+            if ready and ready.get("op") == 2:
+                self.stream_rtc_connected = True
+                d_ready = ready.get("d", {})
+                ssrc = d_ready.get("ssrc", 0)
+                C.ok("alt-viewer", f"твинк успешно подключен к WebRTC медиа-потоку стрима (RTC Ready ssrc={ssrc})")
+
+                def _stream_hb():
+                    last_hb = 0.0
+                    while self.running and self.stream_rtc_ws and not self.stream_rtc_ws.closed:
+                        now = time.time()
+                        if now - last_hb >= max(2.0, hb_interval * 0.9):
+                            try:
+                                self.stream_rtc_ws.send(json.dumps({"op": 3, "d": int(time.time() * 1000)}))
+                                last_hb = now
+                            except Exception:
+                                break
+                        try:
+                            msg = self.stream_rtc_ws.recv(timeout=1.0)
+                            if msg and msg.get("op") == "close":
+                                break
+                        except Exception:
+                            pass
+                    self.stream_rtc_connected = False
+
+                self._stream_hb_thread = threading.Thread(target=_stream_hb, daemon=True)
+                self._stream_hb_thread.start()
+            else:
+                self._close_stream_rtc()
+        except Exception:
+            self._close_stream_rtc()
+
+    def _close_stream_rtc(self) -> None:
+        self.stream_rtc_connected = False
+        if self.stream_rtc_ws:
+            try:
+                self.stream_rtc_ws.close()
+            except Exception:
+                pass
+            self.stream_rtc_ws = None
 
     def _check_guild_active_streams(self, d: dict) -> None:
         g_id = str(d.get("id", ""))
@@ -1253,12 +1483,23 @@ class AutoViewer:
 
                         elif t == "STREAM_CREATE":
                             sk = d.get("stream_key", "")
+                            if d.get("rtc_server_id"):
+                                self.stream_rtc_server_id = str(d["rtc_server_id"])
                             if sk and f":{self.channel_id}:" in sk and not sk.endswith(f":{self.user_id}"):
                                 self.stream_key = sk
                                 if self.voice_connected:
                                     threading.Thread(target=self._send_watch_stream, args=(True,), daemon=True).start()
 
+                        elif t == "STREAM_SERVER_UPDATE":
+                            endpoint = d.get("endpoint") or ""
+                            token = d.get("token") or ""
+                            if d.get("rtc_server_id"):
+                                self.stream_rtc_server_id = str(d["rtc_server_id"])
+                            if endpoint and token and self.running and not self.conflict_paused:
+                                threading.Thread(target=self._connect_stream_rtc, args=(endpoint, token), daemon=True).start()
+
                         elif t == "STREAM_DELETE":
+                            self._close_stream_rtc()
                             del_sk = d.get("stream_key", "")
                             if not self.stream_key or del_sk == self.stream_key:
                                 self.stream_key = ""
@@ -1271,6 +1512,7 @@ class AutoViewer:
                 if self.running:
                     C.warn("alt-viewer", f"сбой соединения твинка: {exc}, повтор через {backoff:.0f}с...")
 
+            self._close_stream_rtc()
             if self.voice_conn:
                 try:
                     self.voice_conn.close()
@@ -1296,6 +1538,7 @@ class AutoViewer:
         self.is_watching = False
         self.voice_connected = False
         self._watched_stream_key = ""
+        self._close_stream_rtc()
         if self.voice_conn:
             try:
                 self.voice_conn.close()
@@ -1463,6 +1706,7 @@ class GatewayStreamEngine:
         self.state = state
         self.session = session
         self.console = console
+        self.telemetry = ScienceTelemetry(self.state.token, self.console) if self.state.token else None
         self.ws: MiniWebSocket | None = None
         self.voice_conn: VoiceConnection | None = None
         self.stream_conn: VoiceConnection | None = None
@@ -2012,6 +2256,8 @@ class GatewayStreamEngine:
         elif event_type == "STREAM_CREATE":
             self.stream_key = d.get("stream_key", "")
             C.ok("stream", f"Go Live created! stream_key: {C.CYAN}{self.stream_key}{C.RESET}")
+            if self.telemetry:
+                self.telemetry.start_stream(guild_id, channel_id)
             if self.state.viewer_token and not self.auto_viewer:
                 self.auto_viewer = AutoViewer(
                     self.state.viewer_token,
@@ -2118,6 +2364,12 @@ class GatewayStreamEngine:
     def _cleanup(self, guild_id: str) -> None:
         C = self.console
         self.running = False
+
+        if self.telemetry:
+            try:
+                self.telemetry.stop_stream(guild_id, getattr(self.state, "last_channel_id", ""))
+            except Exception:
+                pass
 
         if self.auto_viewer:
             try:
@@ -2454,8 +2706,19 @@ class StreamMaximizerApp:
         self.state.save()
 
         target_uid = self.state.streamer_id or _user_id_from_token(self.state.token)
+        if not target_uid and not auto_run:
+            target_uid = input(f"  {C.GREY}ID стримера (основы) [{self.state.streamer_id}]:{C.RESET} ").strip() or self.state.streamer_id
+            if target_uid:
+                self.state.streamer_id = target_uid
+                self.state.save()
+
         viewer = AutoViewer(self.state.viewer_token, guild_id, channel_id, self.console, target_user_id=target_uid)
         viewer.start()
+
+        telemetry = None
+        if self.state.token:
+            telemetry = ScienceTelemetry(self.state.token, self.console)
+            telemetry.start_stream(guild_id, channel_id)
 
         print()
         C.rule()
@@ -2485,6 +2748,8 @@ class StreamMaximizerApp:
                     elapsed_m = int((now - start_t) / 60)
                     if viewer.conflict_paused:
                         st = f"{C.RED}⏸ Пауза Anti-Ban (аккаунт в войсе с другого устройства/VDS){C.WHITE}"
+                    elif viewer.stream_rtc_connected:
+                        st = f"{C.GREEN}👁 Смотрит стрим (WebRTC активен){C.WHITE}"
                     elif viewer.is_watching:
                         st = f"{C.GREEN}👁 Смотрит стрим{C.WHITE}"
                     elif viewer.voice_connected:
@@ -2495,6 +2760,8 @@ class StreamMaximizerApp:
         except (KeyboardInterrupt, Exception):
             pass
         finally:
+            if telemetry:
+                telemetry.stop_stream(guild_id, channel_id)
             viewer.stop()
             print()
             C.ok("exit", "Твинк успешно отключен от голосового канала.")
