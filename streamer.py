@@ -1011,6 +1011,7 @@ class AutoViewer:
         self.stream_rtc_connected = False
         self.stream_rtc_server_id = ""
         self._stream_hb_thread: threading.Thread | None = None
+        self._last_join_attempt = 0.0
 
     def start(self, stream_key: str = "") -> None:
         if not self.token or self.running:
@@ -1025,9 +1026,10 @@ class AutoViewer:
         if not self.ws or self.ws.closed or not self.running:
             return
         now = time.time()
+        self._last_join_attempt = now
         self._voice_join_times = [t for t in self._voice_join_times if now - t < 300.0]
-        if len(self._voice_join_times) >= 4:
-            cooldown = random.uniform(45.0, 75.0)
+        if len(self._voice_join_times) >= 6:
+            cooldown = random.uniform(20.0, 35.0)
             self.console.warn(
                 "anti-ban",
                 f"Защита от частых перезаходов в войс: пауза {cooldown:.0f} сек. для безопасности аккаунта..."
@@ -1040,6 +1042,17 @@ class AutoViewer:
 
         self._voice_join_times.append(time.time())
         try:
+            self.ws.send(json.dumps({
+                "op": 4,
+                "d": {
+                    "guild_id": self.guild_id,
+                    "channel_id": None,
+                    "self_mute": True,
+                    "self_deaf": True,
+                    "self_video": False,
+                }
+            }))
+            time.sleep(0.4)
             self.ws.send(json.dumps({
                 "op": 4,
                 "d": {
@@ -1268,6 +1281,14 @@ class AutoViewer:
                     ):
                         threading.Thread(target=self._send_watch_stream, args=(True,), daemon=True).start()
 
+                    if (
+                        identified
+                        and not self.voice_connected
+                        and not self.conflict_paused
+                        and (now - self._last_join_attempt >= 18.0)
+                    ):
+                        threading.Thread(target=self._send_voice_state_join, daemon=True).start()
+
                     msg = self.ws.recv(timeout=1.0)
                     if not msg:
                         continue
@@ -1393,7 +1414,10 @@ class AutoViewer:
                         elif t == "RESUMED":
                             C.ok("alt-viewer", "сессия твинка успешно восстановлена (RESUMED)")
                             if not self.voice_connected and not self.conflict_paused:
-                                threading.Thread(target=self._send_voice_state_join, daemon=True).start()
+                                def _resumed_join():
+                                    time.sleep(1.0)
+                                    self._send_voice_state_join()
+                                threading.Thread(target=_resumed_join, daemon=True).start()
 
                         elif t == "GUILD_CREATE":
                             self._check_guild_active_streams(d)
