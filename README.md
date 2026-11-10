@@ -123,7 +123,7 @@
 3. Если появится защита от вставки, введите `allow pasting` и нажмите `Enter`.
 4. Вставьте следующую команду и нажмите `Enter`:
 ```javascript
-fetch("https://raw.githubusercontent.com/everyoneexe/discord-game-badge-presence/main/multi-game-presence.js").then(r => r.text()).then(eval);
+fetch("https://raw.githubusercontent.com/nnxHub/Discord-Badge-Farmer/main/multi-game-presence.js").then(r => r.text()).then(eval);
 ```
 *(Либо откройте файл `multi-game-presence.js` из папки репозитория, скопируйте весь код и вставьте в консоль)*.
 
@@ -137,7 +137,7 @@ fetch("https://raw.githubusercontent.com/everyoneexe/discord-game-badge-presence
 
 1. В консоли Discord (`Ctrl + Shift + I` → **Console**) вставьте команду:
 ```javascript
-fetch("https://raw.githubusercontent.com/everyoneexe/discord-game-badge-presence/main/game-time-presence.js").then(r => r.text()).then(eval);
+fetch("https://raw.githubusercontent.com/nnxHub/Discord-Badge-Farmer/main/game-time-presence.js").then(r => r.text()).then(eval);
 ```
 *(Либо откройте файл `game-time-presence.js`, скопируйте код и вставьте в консоль)*.
 
